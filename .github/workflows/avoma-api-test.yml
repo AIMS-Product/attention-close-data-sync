@@ -7,23 +7,23 @@ jobs:
   test-meetings-read:
     runs-on: ubuntu-latest
     steps:
-      - name: Test POST /v1/calls/ against a real Close recording
+      - name: Test POST /v1/calls/ against a real Close recording (Vince)
         run: |
           curl -s -w "\nHTTP_STATUS:%{http_code}\n" \
             -X POST "https://api.avoma.com/v1/calls/" \
             -H "Authorization: Bearer ${AVOMA_API_KEY}" \
             -H "Content-Type: application/json" \
             -d '{
-              "external_id": "acti_KzEVcfZhIFE1shp0No52kwBAV4VHCGBP6PQajb80IiH",
-              "user_email": "kelly@modern-amenities.com",
-              "frm": "+15419398196",
-              "to": "+17134807880",
-              "start_at": "2026-08-18T22:07:31Z",
-              "recording_url": "https://api.close.com/call/acti_KzEVcfZhIFE1shp0No52kwBAV4VHCGBP6PQajb80IiH/recording/",
+              "external_id": "acti_lS5KjYzB1hoXzMfGdxgWG04JlwFftuvRWq42ymO3Jsi",
+              "user_email": "vince@modern-amenities.com",
+              "frm": "+12313034130",
+              "to": "+19162764250",
+              "start_at": "2026-08-28T19:52:16Z",
+              "recording_url": "https://api.close.com/call/acti_lS5KjYzB1hoXzMfGdxgWG04JlwFftuvRWq42ymO3Jsi/recording/",
               "direction": "Outbound",
               "source": "close",
               "participants": [
-                {"email": "shemikawashington.77@gmail.com", "name": "Shemika Washington"}
+                {"email": "lordv8er@gmail.com", "name": "Darrell"}
               ]
             }' \
             -o response.json
