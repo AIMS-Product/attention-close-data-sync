@@ -1,3 +1,12 @@
+name: Avoma API test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-meetings-read:
+    runs-on: ubuntu-latest
+    steps:
       - name: GET /v1/meetings/
         run: |
           curl -s -w "\nHTTP_STATUS:%{http_code}\n" \
