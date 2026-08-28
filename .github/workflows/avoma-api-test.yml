@@ -7,32 +7,30 @@ jobs:
   test-meetings-read:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe transcript/notes/sentiment endpoints
+      - name: Test POST /v1/calls/ against a real Close recording
         run: |
-          BASE="https://api.avoma.com/v1"
-          MEETING_UUID="e5e5dc0a-05bb-410a-9d2b-9ee3ae941359"
-          TRANSCRIPTION_UUID="96c4ebd6-2529-4583-9eac-ba4fc4ec8e5e"
-
-          echo "## Probe results" >> $GITHUB_STEP_SUMMARY
-
-          for path in \
-            "meetings/${MEETING_UUID}/" \
-            "transcriptions/?meeting_uuid=${MEETING_UUID}" \
-            "transcriptions/${TRANSCRIPTION_UUID}/" \
-            "scorecard_evaluations/?meeting_uuid=${MEETING_UUID}" \
-            "notes/?meeting_uuid=${MEETING_UUID}" \
-            "ai_notes/?meeting_uuid=${MEETING_UUID}" \
-            "meeting_sentiments/?meeting_uuid=${MEETING_UUID}" \
-            "meeting_segments/?uuid=${MEETING_UUID}" \
-            ; do
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### GET /$path" >> $GITHUB_STEP_SUMMARY
-            echo '```json' >> $GITHUB_STEP_SUMMARY
-            curl -s -w "\nHTTP_STATUS:%{http_code}" \
-              -H "Authorization: Bearer ${AVOMA_API_KEY}" \
-              "${BASE}/${path}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          done
+          curl -s -w "\nHTTP_STATUS:%{http_code}\n" \
+            -X POST "https://api.avoma.com/v1/calls/" \
+            -H "Authorization: Bearer ${AVOMA_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "external_id": "acti_KzEVcfZhIFE1shp0No52kwBAV4VHCGBP6PQajb80IiH",
+              "user_email": "kelly@modern-amenities.com",
+              "frm": "+15419398196",
+              "to": "+17134807880",
+              "start_at": "2026-08-18T22:07:31Z",
+              "recording_url": "https://api.close.com/call/acti_KzEVcfZhIFE1shp0No52kwBAV4VHCGBP6PQajb80IiH/recording/",
+              "direction": "Outbound",
+              "source": "close",
+              "participants": [
+                {"email": "shemikawashington.77@gmail.com", "name": "Shemika Washington"}
+              ]
+            }' \
+            -o response.json
+          echo "## POST /v1/calls/ response" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat response.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat response.json
         env:
           AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
