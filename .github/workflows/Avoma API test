@@ -1,0 +1,22 @@
+name: Avoma API test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-meetings-read:
+    runs-on: ubuntu-latest
+    steps:
+      - name: GET /v1/meetings/
+        run: |
+          curl -s -w "\nHTTP_STATUS:%{http_code}\n" \
+            -H "Authorization: Bearer ${AVOMA_API_KEY}" \
+            "https://api.avoma.com/v1/meetings/?page_size=3" \
+            -o response.json
+          echo "## Avoma /v1/meetings/ response" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat response.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat response.json
+        env:
+          AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
