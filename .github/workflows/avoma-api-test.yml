@@ -7,16 +7,32 @@ jobs:
   test-meetings-read:
     runs-on: ubuntu-latest
     steps:
-      - name: GET /v1/meetings/
+      - name: Probe transcript/notes/sentiment endpoints
         run: |
-          curl -s -w "\nHTTP_STATUS:%{http_code}\n" \
-            -H "Authorization: Bearer ${AVOMA_API_KEY}" \
-            "https://api.avoma.com/v1/meetings/?page_size=3&from_date=2026-08-01T00:00:00Z&to_date=2026-08-28T23:59:59Z" \
-            -o response.json
-          echo "## Avoma /v1/meetings/ response" >> $GITHUB_STEP_SUMMARY
-          echo '```json' >> $GITHUB_STEP_SUMMARY
-          cat response.json >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat response.json
+          BASE="https://api.avoma.com/v1"
+          MEETING_UUID="e5e5dc0a-05bb-410a-9d2b-9ee3ae941359"
+          TRANSCRIPTION_UUID="96c4ebd6-2529-4583-9eac-ba4fc4ec8e5e"
+
+          echo "## Probe results" >> $GITHUB_STEP_SUMMARY
+
+          for path in \
+            "meetings/${MEETING_UUID}/" \
+            "transcriptions/?meeting_uuid=${MEETING_UUID}" \
+            "transcriptions/${TRANSCRIPTION_UUID}/" \
+            "scorecard_evaluations/?meeting_uuid=${MEETING_UUID}" \
+            "notes/?meeting_uuid=${MEETING_UUID}" \
+            "ai_notes/?meeting_uuid=${MEETING_UUID}" \
+            "meeting_sentiments/?meeting_uuid=${MEETING_UUID}" \
+            "meeting_segments/?uuid=${MEETING_UUID}" \
+            ; do
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### GET /$path" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            curl -s -w "\nHTTP_STATUS:%{http_code}" \
+              -H "Authorization: Bearer ${AVOMA_API_KEY}" \
+              "${BASE}/${path}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          done
         env:
           AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
