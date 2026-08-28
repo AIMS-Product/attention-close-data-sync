@@ -7,27 +7,13 @@ jobs:
   test-meetings-read:
     runs-on: ubuntu-latest
     steps:
-      - name: Test POST /v1/calls/ against a real Close recording (Vince)
+      - name: Check processing status of the test call
         run: |
           curl -s -w "\nHTTP_STATUS:%{http_code}\n" \
-            -X POST "https://api.avoma.com/v1/calls/" \
             -H "Authorization: Bearer ${AVOMA_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "external_id": "acti_lS5KjYzB1hoXzMfGdxgWG04JlwFftuvRWq42ymO3Jsi",
-              "user_email": "vince@modern-amenities.com",
-              "frm": "+12313034130",
-              "to": "+19162764250",
-              "start_at": "2026-08-28T19:52:16Z",
-              "recording_url": "https://api.close.com/call/acti_lS5KjYzB1hoXzMfGdxgWG04JlwFftuvRWq42ymO3Jsi/recording/",
-              "direction": "Outbound",
-              "source": "close",
-              "participants": [
-                {"email": "lordv8er@gmail.com", "name": "Darrell"}
-              ]
-            }' \
+            "https://api.avoma.com/v1/meetings/b08e396b-021d-4071-b461-8324e6680d5b/" \
             -o response.json
-          echo "## POST /v1/calls/ response" >> $GITHUB_STEP_SUMMARY
+          echo "## Meeting status" >> $GITHUB_STEP_SUMMARY
           echo '```json' >> $GITHUB_STEP_SUMMARY
           cat response.json >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
