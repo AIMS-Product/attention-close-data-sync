@@ -1,0 +1,54 @@
+name: Avoma → Close Meeting Analysis Sync
+
+on:
+  schedule:
+    # Hourly at :45, scheduled AFTER:
+    #   :00 - sync.py                             (first sales calls → lead fields)
+    #   :15 - close_to_avoma_sync.py               (Close dialer recordings → Avoma)
+    #   :30 - avoma_to_close_dialer_sync.py         (dialer analyses → Close CA)
+    # This is the last slot in the loop, picking up follow-up / discovery /
+    # setter / next-steps / rescheduled meetings that none of the other
+    # syncs handle. Late-arrivals get picked up the next hour (idempotency
+    # check on Attention Call ID, which stores the Avoma meeting UUID,
+    # prevents duplicates).
+    - cron: '45 * * * *'
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: 'Window of Avoma meetings to consider, in hours'
+        required: false
+        default: '24'
+      dry_run:
+        description: 'Dry run (1 = log payloads without writing to Close)'
+        required: false
+        default: '0'
+
+concurrency:
+  group: avoma-to-close-meeting-sync
+  cancel-in-progress: false
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run meeting analysis sync
+        env:
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HOURS_BACK: ${{ inputs.hours_back || '24' }}
+          DRY_RUN: ${{ inputs.dry_run || '0' }}
+        run: python3 -u avoma_to_close_meeting_sync.py
