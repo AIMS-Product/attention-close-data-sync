@@ -33,16 +33,18 @@ before handing that URL to Avoma.
 READ THIS FIRST — status and assumptions (full write-up in
 avoma-migration-rebuild-plan.md in the project docs):
 
-1. **RECORDING STORAGE BACKEND — NOT YET IMPLEMENTED, THIS BLOCKS REAL
-   RUNS.** `upload_recording_and_get_public_url()` below is a deliberate
-   stub (raises NotImplementedError) because the storage backend (S3 / R2
-   / GCS / other) hasn't been decided yet. Everything else in this script
-   — the Avoma-user gate, idempotency check, participant/payload
-   construction — is complete and runs today under DRY_RUN=1 (DRY_RUN
-   short-circuits BEFORE the download/upload/POST, same as the Attention
-   version did). Once a backend is picked, fill in that one function —
-   ready-to-adapt reference implementations for all three options are in
-   its docstring — and this script is done.
+1. **RECORDING STORAGE BACKEND — RESOLVED 2026-09-03.** S3 bucket
+   `vp-avoma-recordings` (Ohio / us-east-2), with a dedicated IAM user
+   (`avoma-recording-uploader`) scoped to `s3:PutObject`/`s3:GetObject` on
+   just that bucket — not Stephen's own admin credentials. Bucket keeps
+   "Block all public access" ON; `upload_recording_and_get_public_url()`
+   uploads the MP3 and hands back a presigned GET URL instead of relying
+   on a public bucket policy. Needs `boto3` in the workflow's `pip
+   install` step (added — see close_to_avoma_sync.yml) and
+   `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION` as
+   GitHub secrets (boto3 reads these from the environment automatically).
+   UNVERIFIED: this hasn't been run end-to-end against a real Close call
+   yet — first non-DRY_RUN run should be watched closely.
 
 2. **Avoma-user gate** (`avoma_build_active_user_emails` /
    `avoma_active_user_emails`) — CONFIRMED NECESSARY: `POST /v1/calls/`
@@ -93,14 +95,15 @@ avoma-migration-rebuild-plan.md in the project docs):
 Required GitHub secrets:
   CLOSE_API_KEY         Close API key (Basic auth)
   AVOMA_API_KEY         Avoma org API key (Bearer auth)
-  (plus whatever the storage backend needs once #1 above is filled in —
-  e.g. AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY + a bucket name for S3/R2,
-  or a GCS service-account key)
+  AWS_ACCESS_KEY_ID     Access key for the avoma-recording-uploader IAM user
+  AWS_SECRET_ACCESS_KEY Secret key for the same IAM user
+  AWS_DEFAULT_REGION    e.g. "us-east-2" (bucket's region)
 
 Optional env vars:
   HOURS_BACK                 Window of recent Close calls to consider (default: 8)
   MIN_DURATION                Skip calls shorter than this in seconds (default: 180)
   DRY_RUN                     If "1", log what would happen but don't import
+  RECORDING_PROXY_BUCKET      S3 bucket for re-hosted recordings (default: "vp-avoma-recordings")
   RECORDING_URL_TTL_SECONDS   TTL for the re-hosted recording URL (default: 3600)
   ATTACH_CRM_ASSOCIATION      If "1", attach crm_association (see assumption #5)
 """
@@ -111,6 +114,7 @@ import base64
 import time
 import json
 import requests
+import boto3
 from datetime import datetime, timezone, timedelta
 
 # ===== Config =====
@@ -121,6 +125,12 @@ MIN_DURATION = int(os.environ.get("MIN_DURATION", "180"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 RECORDING_URL_TTL_SECONDS = int(os.environ.get("RECORDING_URL_TTL_SECONDS", "3600"))
 ATTACH_CRM_ASSOCIATION = os.environ.get("ATTACH_CRM_ASSOCIATION", "0") == "1"
+
+# S3 bucket used by upload_recording_and_get_public_url() below. Standard
+# AWS SDK auth (boto3 picks up AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+# AWS_DEFAULT_REGION from the environment automatically — no explicit
+# credential wiring needed here).
+RECORDING_PROXY_BUCKET = os.environ.get("RECORDING_PROXY_BUCKET", "vp-avoma-recordings")
 
 CLOSE_API_BASE = "https://api.close.com/api/v1"
 AVOMA_API_BASE = "https://api.avoma.com/v1"
@@ -331,72 +341,60 @@ def avoma_import_call(payload):
 
 
 # ===== Recording storage shim =====
+_s3_client = None
+
+
+def _get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        # Standard boto3 auth: picks up AWS_ACCESS_KEY_ID /
+        # AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION from the environment
+        # (set as GitHub Actions secrets — see close_to_avoma_sync.yml).
+        # No hardcoded credentials here.
+        _s3_client = boto3.client("s3")
+    return _s3_client
+
+
 def upload_recording_and_get_public_url(audio_bytes, content_type, call_id):
     """
-    ========================================================================
-    PLUGGABLE SHIM — NOT YET IMPLEMENTED. Stephen hasn't picked a storage
-    backend (S3 / R2 / GCS / other) yet — see assumption #1 in the module
-    docstring. This is the ONE function standing between this script and a
-    real (non-DRY_RUN) run; everything else is complete and reviewable
-    today via DRY_RUN=1, which short-circuits before this is ever called.
+    Uploads one call recording to S3 (bucket: RECORDING_PROXY_BUCKET, i.e.
+    `vp-avoma-recordings`) under an `avoma-dialer-recordings/` prefix keyed
+    by Close call ID, then returns a presigned GET URL so Avoma can fetch
+    it over plain HTTPS with no auth — Avoma could not authenticate to
+    Close's own Basic-auth-gated recording URL (confirmed 2026-08-28), so
+    this is the shim step that closes that gap.
 
-    Contract: given the raw MP3 bytes downloaded from Close, upload them
-    somewhere Avoma's servers can reach over plain HTTPS with NO auth
-    (Avoma could not authenticate to Close's own gated recording URL —
-    confirmed 2026-08-28), and return that public/presigned URL. A short
-    TTL is fine — Avoma fetches promptly after POST /v1/calls/.
-    RECORDING_URL_TTL_SECONDS (default 3600s) is a starting point.
-
-    Reference implementations for the three options discussed, ready to
-    uncomment and adapt once a backend is picked. All three write under an
-    `avoma-dialer-recordings/` prefix keyed by Close call ID.
-
-    --- AWS S3 (boto3; add `boto3` to the workflow's `pip install` step) ---
-        import boto3
-        s3 = boto3.client("s3")
-        bucket = os.environ["RECORDING_PROXY_BUCKET"]
-        key = f"avoma-dialer-recordings/{call_id}.mp3"
-        s3.put_object(Bucket=bucket, Key=key, Body=audio_bytes, ContentType=content_type)
-        return s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": key},
-            ExpiresIn=RECORDING_URL_TTL_SECONDS,
-        )
-
-    --- Cloudflare R2 (boto3, S3-compatible endpoint) ---
-        import boto3
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        )
-        bucket = os.environ["RECORDING_PROXY_BUCKET"]
-        key = f"avoma-dialer-recordings/{call_id}.mp3"
-        s3.put_object(Bucket=bucket, Key=key, Body=audio_bytes, ContentType=content_type)
-        return s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": key},
-            ExpiresIn=RECORDING_URL_TTL_SECONDS,
-        )
-
-    --- Google Cloud Storage (add `google-cloud-storage` to pip install) ---
-        from google.cloud import storage
-        from datetime import timedelta
-        client = storage.Client()
-        bucket = client.bucket(os.environ["RECORDING_PROXY_BUCKET"])
-        blob = bucket.blob(f"avoma-dialer-recordings/{call_id}.mp3")
-        blob.upload_from_string(audio_bytes, content_type=content_type)
-        return blob.generate_signed_url(expiration=timedelta(seconds=RECORDING_URL_TTL_SECONDS))
-    ========================================================================
+    The bucket keeps "Block all public access" ON (per setup) — nothing
+    about it is public. A presigned URL grants time-limited access to that
+    one object regardless of the bucket's public-access settings, expiring
+    after RECORDING_URL_TTL_SECONDS (default 3600s / 1hr), which is far
+    longer than Avoma needs to fetch it after POST /v1/calls/. If a
+    lifecycle rule was set up on the bucket (recommended — see
+    avoma-migration-rebuild-plan.md), the underlying object also
+    self-deletes after ~1 day regardless of whether the presigned URL was
+    ever used.
     """
-    raise NotImplementedError(
-        "upload_recording_and_get_public_url() is a stub — pick a storage "
-        "backend (S3 / R2 / GCS) and fill this in; see its docstring for "
-        "ready-to-adapt reference code for all three. Run with DRY_RUN=1 "
-        "in the meantime — DRY_RUN skips this call entirely, so the "
-        "Avoma-user gate, idempotency check, and payload construction can "
-        "all be reviewed today."
+    if not RECORDING_PROXY_BUCKET:
+        raise Exception(
+            "RECORDING_PROXY_BUCKET is not set — this is required for a "
+            "real (non-DRY_RUN) run. Set it to 'vp-avoma-recordings' as a "
+            "workflow env var / GitHub secret."
+        )
+
+    s3 = _get_s3_client()
+    key = f"avoma-dialer-recordings/{call_id}.mp3"
+
+    s3.put_object(
+        Bucket=RECORDING_PROXY_BUCKET,
+        Key=key,
+        Body=audio_bytes,
+        ContentType=content_type,
+    )
+
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": RECORDING_PROXY_BUCKET, "Key": key},
+        ExpiresIn=RECORDING_URL_TTL_SECONDS,
     )
 
 
