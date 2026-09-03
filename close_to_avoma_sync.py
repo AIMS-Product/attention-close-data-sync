@@ -46,20 +46,22 @@ avoma-migration-rebuild-plan.md in the project docs):
    UNVERIFIED: this hasn't been run end-to-end against a real Close call
    yet — first non-DRY_RUN run should be watched closely.
 
-2. **Avoma-user gate** (`avoma_build_active_user_emails` /
-   `avoma_active_user_emails`) — CONFIRMED NECESSARY: `POST /v1/calls/`
-   rejects any `user_email` that isn't an existing, active Avoma user
-   (tested 2026-08-28 against Kelly Schrader, not yet onboarded — got
-   `{"user_email":["User (kelly@modern-amenities.com) with this email not
-   found."]}`). This script checks the Close rep's email against Avoma's
-   user list first and skips-and-logs if they're not seated yet, rather
-   than letting the POST fail. UNVERIFIED DETAIL: whether `GET /v1/users/`
-   distinguishes "invited, not yet accepted" from "active" — the handoff
-   doc only confirms the endpoint is read-only, not its exact fields. If
-   invited-but-not-accepted users show up in this list, the gate will
+2. **Avoma-user gate** (`avoma_build_active_user_emails`) — CONFIRMED
+   NECESSARY: `POST /v1/calls/` rejects any `user_email` that isn't an
+   existing, active Avoma user (tested 2026-08-28 against Kelly Schrader,
+   not yet onboarded — got `{"user_email":["User
+   (kelly@modern-amenities.com) with this email not found."]}`). This
+   script checks the Close rep's email against Avoma's user list first and
+   skips-and-logs if they're not seated yet, rather than letting the POST
+   fail. CONFIRMED 2026-09-03 (first real workflow run, fixed after a
+   crash): `GET /v1/users/` returns a bare JSON list, NOT the
+   `{"results": [...], "next": ...}` paginated envelope every other listed
+   endpoint uses — handled defensively now. Still UNVERIFIED: whether that
+   list distinguishes "invited, not yet accepted" from "active" — if
+   invited-but-not-accepted users show up in it, the gate will
    under-filter (a rep who looks seated but hasn't actually accepted their
-   invite) and you'll see the same 400 from Avoma; tighten the filter in
-   `avoma_build_active_user_emails` once you've seen a real response.
+   invite) and you'll see the same 400 from Avoma downstream; tighten the
+   filter in `avoma_build_active_user_emails` if that happens.
 
 3. **`participants` payload shape** — UNVERIFIED. The handoff doc confirms
    `POST /v1/calls/` accepts a `participants` field but not its exact
@@ -283,6 +285,12 @@ def avoma_build_active_user_emails():
     in the response is unconfirmed; this includes every user the endpoint
     returns. Tighten if invited-but-not-accepted users turn out to be
     included and you start seeing 400s despite passing this gate.
+
+    CONFIRMED 2026-09-03 (first real workflow run): unlike /v1/meetings/ and
+    /v1/scorecard_evaluations/, GET /v1/users/ does NOT use the
+    {"results": [...], "next": ...} paginated envelope — it returns a bare
+    JSON list. Handled defensively below in case that ever changes (or
+    differs across pages) without needing another fix.
     """
     emails = set()
     url = "/users/"
@@ -292,11 +300,19 @@ def avoma_build_active_user_emails():
         if not resp.ok:
             raise Exception(f"Could not list Avoma users: {resp.status_code}: {resp.text[:300]}")
         body = resp.json()
-        for u in body.get("results", []):
+
+        if isinstance(body, list):
+            users = body
+            next_url = None  # bare list — confirmed no pagination envelope
+        else:
+            users = body.get("results", [])
+            next_url = body.get("next")
+
+        for u in users:
             email = (u.get("email") or "").lower().strip()
             if email:
                 emails.add(email)
-        next_url = body.get("next")
+
         if not next_url:
             break
         url = next_url
