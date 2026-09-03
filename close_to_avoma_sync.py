@@ -63,6 +63,16 @@ avoma-migration-rebuild-plan.md in the project docs):
    invite) and you'll see the same 400 from Avoma downstream; tighten the
    filter in `avoma_build_active_user_emails` if that happens.
 
+   **2026-09-03, second dry run: gate returned 0 Avoma users, skipping
+   100% of 35 eligible calls.** Every call was skipped at this gate — not
+   a partial under-seating issue, a total one. Since the script didn't
+   raise (it only raises on a non-2xx response), `GET /v1/users/` returned
+   HTTP 200 with something that parsed to zero usable entries — either a
+   genuinely empty list, or a shape `avoma_build_active_user_emails`
+   isn't handling. Added a debug branch below (see the `page_count == 0`
+   block) to print the raw response shape/preview next run instead of
+   guessing further.
+
 3. **`participants` payload shape** — UNVERIFIED. The handoff doc confirms
    `POST /v1/calls/` accepts a `participants` field but not its exact
    shape. This assumes `[{"email":..., "name":..., "is_rep": bool}, ...]`,
@@ -291,6 +301,13 @@ def avoma_build_active_user_emails():
     {"results": [...], "next": ...} paginated envelope — it returns a bare
     JSON list. Handled defensively below in case that ever changes (or
     differs across pages) without needing another fix.
+
+    2026-09-03, second dry run: this returned 0 emails, gating out every
+    single eligible call. Since a non-2xx would have raised, the endpoint
+    returned 200 with something that parsed to zero entries. Added a debug
+    log below (fires whenever a page parses to 0 entries) to capture the
+    raw status/body shape on the next run instead of guessing further —
+    remove once the root cause is confirmed and fixed.
     """
     emails = set()
     url = "/users/"
@@ -307,6 +324,19 @@ def avoma_build_active_user_emails():
         else:
             users = body.get("results", [])
             next_url = body.get("next")
+
+        # DEBUG — temporary, added 2026-09-03 after a dry run returned 0
+        # Avoma users org-wide. If this fires, the raw_preview tells us
+        # whether the response is genuinely an empty list/results, or a
+        # shape (e.g. a different key than "results", or an error object
+        # that still returned 200) this parser doesn't recognize.
+        if len(users) == 0:
+            log(
+                f"⚠️  DEBUG: /v1/users/ page parsed to 0 entries — "
+                f"status={resp.status_code}, body_type={type(body).__name__}, "
+                f"raw_preview={json.dumps(body)[:800]}",
+                indent=1,
+            )
 
         for u in users:
             email = (u.get("email") or "").lower().strip()
