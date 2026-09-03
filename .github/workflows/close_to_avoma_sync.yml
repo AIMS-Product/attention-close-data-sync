@@ -40,11 +40,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        # NOTE: once upload_recording_and_get_public_url() in
-        # close_to_avoma_sync.py is filled in with a real storage backend,
-        # add that backend's SDK here too — e.g. `pip install requests boto3`
-        # for S3/R2, or `pip install requests google-cloud-storage` for GCS.
-        run: pip install requests
+        run: pip install requests boto3
 
       - name: Run Close → Avoma dialer sync
         env:
@@ -52,8 +48,8 @@ jobs:
           AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
           HOURS_BACK: ${{ inputs.hours_back || '8' }}
           DRY_RUN: ${{ inputs.dry_run || '0' }}
-          # Add RECORDING_URL_TTL_SECONDS / ATTACH_CRM_ASSOCIATION here, and
-          # whatever secrets the chosen storage backend needs (e.g.
-          # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / RECORDING_PROXY_BUCKET),
-          # once upload_recording_and_get_public_url() is implemented.
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+          RECORDING_PROXY_BUCKET: vp-avoma-recordings
         run: python3 -u close_to_avoma_sync.py
