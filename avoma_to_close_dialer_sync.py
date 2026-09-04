@@ -302,7 +302,15 @@ def _slate_node_text(node):
     if isinstance(node, str):
         return node
     if isinstance(node, list):
-        return "".join(_slate_node_text(n) for n in node)
+        # Join with a space, not "" — sibling nodes at this level are
+        # usually distinct text runs or nested sub-items (e.g. a bullet's
+        # own text followed by a nested sub-list), and joining with no
+        # separator glued them into unreadable run-ons like
+        # "JosephResend the proposal..." (confirmed 2026-09-04). A rare
+        # mid-word split across marks (bold/italic) picks up one extra
+        # space, which is a minor cosmetic cost worth the readability win.
+        parts = [_slate_node_text(n) for n in node]
+        return " ".join(p for p in parts if p)
     if isinstance(node, dict):
         if isinstance(node.get("text"), str):
             return node["text"]
@@ -310,6 +318,24 @@ def _slate_node_text(node):
         if children:
             return _slate_node_text(children)
     return ""
+
+
+def _slate_block_to_lines(children):
+    """Extract one text line per top-level child of a content block,
+    instead of flattening the whole block into one run-on string.
+    _slate_node_text() recurses through everything and concatenates with
+    no separator, which is why multi-bullet lists (Key Takeaways, Action
+    Items, etc.) were coming through as one glued-together sentence with
+    no spacing (confirmed 2026-09-04 against a real payload)."""
+    if not isinstance(children, list):
+        text = _slate_node_text(children).strip()
+        return [text] if text else []
+    lines = []
+    for child in children:
+        text = _slate_node_text(child).strip()
+        if text:
+            lines.append(text)
+    return lines
 
 
 def parse_avoma_notes(notes_response):
@@ -364,19 +390,34 @@ def parse_avoma_notes(notes_response):
     current_category = None
     for block in blocks:
         btype = str(block.get("type") or block.get("object") or "").lower()
-        text = _slate_node_text(block.get("children")).strip()
-        if not text:
-            continue
         if btype.startswith("header"):
-            current_category = NOTES_CATEGORY_ALIASES.get(text.lower(), text)
+            header_text = _slate_node_text(block.get("children")).strip()
+            if header_text:
+                current_category = NOTES_CATEGORY_ALIASES.get(header_text.lower(), header_text)
             continue
-        if current_category:
-            out[current_category] = (
-                (out[current_category] + "\n\n" + text).strip()
-                if current_category in out
-                else text
-            )
+        if not current_category:
+            continue
+        lines = _slate_block_to_lines(block.get("children"))
+        if not lines:
+            continue
+        bulleted = "\n".join(f"• {line}" for line in lines)
+        out[current_category] = (
+            (out[current_category] + "\n" + bulleted)
+            if current_category in out
+            else bulleted
+        )
     return out
+
+
+def build_full_call_summary(notes):
+    """Combine every parsed category (Key Takeaways, Action Items,
+    Situational Analysis, etc.) into one Call Summary block, in the order
+    Avoma's notes document presents them — not just "Key Takeaways" alone.
+    Requested 2026-09-04 after Stephen compared our output to the full
+    notes view in the Avoma UI and wanted everything, not one section."""
+    if not notes:
+        return ""
+    return "\n\n".join(f"{category}\n{content}" for category, content in notes.items())
 
 
 def get_note_value(notes_dict, category_name):
@@ -702,7 +743,11 @@ def enrich_call(close_call, type_info):
     # 4. Pull analysis fields (blank/None when analysis isn't ready)
     qa_score = extract_qa_score(evaluations)
     doubt_text = get_note_value(notes, DOUBT_ANALOG_CATEGORY)
-    call_summary = get_note_value(notes, CALL_SUMMARY_ANALOG_CATEGORY)
+    # Call Summary = every parsed category concatenated (Key Takeaways,
+    # Action Items, Situational Analysis, etc.), not just one section —
+    # see build_full_call_summary().
+    call_summary = build_full_call_summary(notes)
+    log(f"Call summary length: {len(call_summary)} chars across {len(notes)} categories", indent=1)
 
     # 5. Claude Haiku enrichment (each function already no-ops on empty
     #    input, so this is safe to call unconditionally even in
