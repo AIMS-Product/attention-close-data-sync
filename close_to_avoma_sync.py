@@ -302,16 +302,24 @@ def avoma_build_active_user_emails():
     JSON list. Handled defensively below in case that ever changes (or
     differs across pages) without needing another fix.
 
-    2026-09-03, second dry run: this returned 0 emails, gating out every
-    single eligible call. Since a non-2xx would have raised, the endpoint
-    returned 200 with something that parsed to zero entries. Added a debug
-    log below (fires whenever a page parses to 0 entries) to capture the
-    raw status/body shape on the next run instead of guessing further —
-    remove once the root cause is confirmed and fixed.
+    2026-09-03, second and third dry runs: this returned 0 emails twice in
+    a row, gating out every eligible call both times. A first debug pass
+    (checking whether the parsed page list itself was empty) did NOT fire
+    on the third run — meaning `/v1/users/` is very likely returning real,
+    non-empty user records, just not under an `email` key this parser
+    recognizes (could be `work_email`, `primary_email`, nested under
+    another key, etc.), so every user silently fails the `u.get("email")`
+    check and the set ends up empty regardless of how many users actually
+    exist. Reworked the debug block below accordingly: it now tracks the
+    raw entry count across all pages and, if the final email set is still
+    empty, logs the first raw user record so we can see its actual field
+    names. Remove once the root cause is confirmed and fixed.
     """
     emails = set()
     url = "/users/"
     params = {"page_size": 100}
+    total_raw_entries = 0
+    first_raw_entry = None
     for _ in range(50):
         resp = avoma_get(url, params=params)
         if not resp.ok:
@@ -325,18 +333,9 @@ def avoma_build_active_user_emails():
             users = body.get("results", [])
             next_url = body.get("next")
 
-        # DEBUG — temporary, added 2026-09-03 after a dry run returned 0
-        # Avoma users org-wide. If this fires, the raw_preview tells us
-        # whether the response is genuinely an empty list/results, or a
-        # shape (e.g. a different key than "results", or an error object
-        # that still returned 200) this parser doesn't recognize.
-        if len(users) == 0:
-            log(
-                f"⚠️  DEBUG: /v1/users/ page parsed to 0 entries — "
-                f"status={resp.status_code}, body_type={type(body).__name__}, "
-                f"raw_preview={json.dumps(body)[:800]}",
-                indent=1,
-            )
+        total_raw_entries += len(users)
+        if first_raw_entry is None and users:
+            first_raw_entry = users[0]
 
         for u in users:
             email = (u.get("email") or "").lower().strip()
@@ -347,6 +346,20 @@ def avoma_build_active_user_emails():
             break
         url = next_url
         params = None
+
+    # DEBUG — temporary, added 2026-09-03 after two dry runs in a row
+    # returned 0 usable Avoma users org-wide despite the request itself
+    # succeeding. Tells us definitively whether /v1/users/ is genuinely
+    # empty (first_raw_entry stays None) or has real entries under an
+    # unrecognized email field (sample entry printed below).
+    if not emails:
+        log(
+            f"⚠️  DEBUG: /v1/users/ returned {total_raw_entries} raw "
+            f"entries across all pages but 0 usable emails. "
+            f"{'Sample entry: ' + json.dumps(first_raw_entry)[:800] if first_raw_entry else '(no entries returned at all — genuinely empty)'}",
+            indent=1,
+        )
+
     return emails
 
 
