@@ -1,14 +1,21 @@
 name: Avoma → Close Dialer Enrichment
 
 on:
-  schedule:
-    # Hourly at :30, scheduled AFTER:
-    #   :00 - existing Avoma → Close sync (video calls)
-    #   :15 - close_to_avoma_sync (Close dialer → Avoma)
-    # This gives uploaded dialer calls 15 minutes to process before we look
-    # for them. Late-processed ones get picked up next round (idempotency
-    # check prevents duplicates).
-    - cron: '30 * * * *'
+  # Schedule intentionally disabled 2026-09-04 while the Avoma rebuild is
+  # being rolled out — Stephen wants to avoid duplicate Custom Activity
+  # records in Close while both the Attention and Avoma pipelines could
+  # otherwise run against the same data. The Attention-based scripts stay
+  # on their existing schedule. Re-enable by uncommenting the `schedule:`
+  # block below once Stephen confirms. Manual runs still work via
+  # workflow_dispatch in the meantime.
+  # schedule:
+  #   # Hourly at :30, scheduled AFTER:
+  #   #   :00 - existing Avoma → Close sync (video calls)
+  #   #   :15 - close_to_avoma_sync (Close dialer → Avoma)
+  #   # This gives uploaded dialer calls 15 minutes to process before we look
+  #   # for them. Late-processed ones get picked up next round (idempotency
+  #   # check prevents duplicates).
+  #   - cron: '30 * * * *'
   workflow_dispatch:
     inputs:
       hours_back:
