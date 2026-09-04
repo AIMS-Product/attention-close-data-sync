@@ -20,8 +20,15 @@ plan.md in the project docs):
 
 1. CLOSE-SIDE NAMING — CUSTOM_ACTIVITY_TYPE_NAME / CLOSE_FIELD_NAMES below
    default to reusing the existing Attention CA type/field names.
-2. NOTES → FIELD MAPPING — Pain Points ≈ Doubt, Key Takeaways ≈ Call
-   Summary. UNVERIFIED against a real sales call.
+2. NOTES → FIELD MAPPING — CONFIRMED 2026-09-04 (via avoma_to_close_dialer_
+   sync.py, which hit the same /v1/notes/ endpoint against real analyzed
+   calls). parse_avoma_notes() now walks the real flat Slate block
+   structure (header-2 blocks name each category, followed by content
+   blocks until the next header) instead of the old flat category/header
+   guess. Call Summary is now every parsed category concatenated (see
+   build_full_call_summary), not just "Key Takeaways" alone. "Pain
+   Points" isn't guaranteed to exist on every call — comes through blank
+   when a call has no discovery objections, which is expected.
 3. QA SCORE SHAPE — extract_qa_score()'s field-name guesses are unverified;
    no live scorecard has scored a real call yet.
 4. ATTENDANCE / SHOW-UP — derive_show_value() is a duration + speaker-
@@ -283,14 +290,21 @@ def avoma_get_meeting_segments(meeting_uuid):
     return resp.json()
 
 
-# ===== Avoma notes parsing (assumption #2) =====
+# ===== Avoma notes parsing (assumption #2 — CONFIRMED 2026-09-04, see below) =====
 def _slate_node_text(node):
     if node is None:
         return ""
     if isinstance(node, str):
         return node
     if isinstance(node, list):
-        return "".join(_slate_node_text(n) for n in node)
+        # Join with a space, not "" — sibling nodes at this level are
+        # usually distinct text runs or nested sub-items (e.g. a bullet's
+        # own text followed by a nested sub-list), and joining with no
+        # separator glues them into unreadable run-ons like "JosephResend
+        # the proposal..." (confirmed against a real avoma_to_close_dialer_
+        # sync.py payload 2026-09-04, same underlying bug here).
+        parts = [_slate_node_text(n) for n in node]
+        return " ".join(p for p in parts if p)
     if isinstance(node, dict):
         if isinstance(node.get("text"), str):
             return node["text"]
@@ -300,43 +314,115 @@ def _slate_node_text(node):
     return ""
 
 
+def _slate_block_to_lines(children):
+    """Extract one text line per top-level child of a content block,
+    instead of flattening the whole block into one run-on string."""
+    if not isinstance(children, list):
+        text = _slate_node_text(children).strip()
+        return [text] if text else []
+    lines = []
+    for child in children:
+        text = _slate_node_text(child).strip()
+        if text:
+            lines.append(text)
+    return lines
+
+
+def _find_block_list(obj, depth=0, max_depth=6):
+    """Hunt for a nested list of Slate-style blocks (dicts with a "type"
+    key) inside an arbitrarily-nested /notes/ record, so we don't depend
+    on a hardcoded key path that might not be stable."""
+    if depth > max_depth:
+        return None
+    if isinstance(obj, list) and obj and all(isinstance(x, dict) for x in obj[:5]):
+        if any(("type" in x or "object" in x) for x in obj[:5]):
+            return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_block_list(v, depth + 1, max_depth)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_block_list(v, depth + 1, max_depth)
+            if found:
+                return found
+    return None
+
+
 def parse_avoma_notes(notes_response):
+    """
+    CONFIRMED 2026-09-04 against real analyzed calls (via
+    avoma_to_close_dialer_sync.py, same /v1/notes/ endpoint). Avoma's
+    /notes/ endpoint returns a paginated envelope
+    ({"count","next","previous","results"}); "results" holds one
+    (occasionally more) wrapper record(s), and the actual note content is
+    a FLAT Slate-style block list nested somewhere inside each record
+    (found dynamically via _find_block_list rather than a hardcoded key
+    path, since the exact wrapper key wasn't confirmed and may not be
+    stable). Blocks alternate: a "header-2"-type block whose extracted
+    text is the category name (e.g. "Key Takeaways", "Pain Points",
+    "Action Items", plus many call-specific categories like "Situational
+    Analysis (current vs desired state)"), followed by one or more
+    content blocks (typically "unordered-list") whose extracted text is
+    that category's content, until the next header block.
+    """
     if not notes_response:
         return {}
 
-    items = notes_response
+    records = notes_response
     if isinstance(notes_response, dict):
-        items = (
+        records = (
             notes_response.get("results")
             or notes_response.get("data")
             or notes_response.get("notes")
             or []
         )
-        if isinstance(items, dict):
-            items = [{"category": k, "content": v} for k, v in items.items()]
+        if isinstance(records, dict):
+            records = [records]
+    if not isinstance(records, list):
+        return {}
+
+    blocks = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("type") or record.get("object"):
+            blocks.append(record)
+            continue
+        nested = _find_block_list(record)
+        if nested:
+            blocks.extend(b for b in nested if isinstance(b, dict))
 
     out = {}
-    for item in items or []:
-        if not isinstance(item, dict):
+    current_category = None
+    for block in blocks:
+        btype = str(block.get("type") or block.get("object") or "").lower()
+        if btype.startswith("header"):
+            header_text = _slate_node_text(block.get("children")).strip()
+            if header_text:
+                current_category = NOTES_CATEGORY_ALIASES.get(header_text.lower(), header_text)
             continue
-        header = None
-        for key in ("category", "header", "title", "name", "label", "type"):
-            if item.get(key):
-                header = str(item[key]).strip()
-                break
-        if not header:
+        if not current_category:
             continue
-        content = None
-        for key in ("content", "children", "value", "body", "text", "notes"):
-            if key in item:
-                content = item[key]
-                break
-        text = _slate_node_text(content).strip()
-        if not text:
+        lines = _slate_block_to_lines(block.get("children"))
+        if not lines:
             continue
-        canonical = NOTES_CATEGORY_ALIASES.get(header.lower(), header)
-        out[canonical] = (out[canonical] + "\n\n" + text).strip() if canonical in out else text
+        bulleted = "\n".join(f"• {line}" for line in lines)
+        out[current_category] = (
+            (out[current_category] + "\n" + bulleted)
+            if current_category in out
+            else bulleted
+        )
     return out
+
+
+def build_full_call_summary(notes):
+    """Combine every parsed category into one Call Summary block, in the
+    order Avoma's notes document presents them — not just one section."""
+    if not notes:
+        return ""
+    return "\n\n".join(f"{category}\n{content}" for category, content in notes.items())
 
 
 def get_note_value(notes_dict, category_name):
@@ -696,6 +782,7 @@ def process_meeting(meeting, type_info):
     evaluations = avoma_get_scorecard_evaluations(uuid)
     notes_raw = avoma_get_notes(uuid)
     notes = parse_avoma_notes(notes_raw)
+    log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
     if not evaluations and not notes:
         log("→ Avoma analysis not yet complete (no scorecard evaluations, no notes), skip", indent=1)
         return ("skipped", "not-analyzed")
@@ -736,7 +823,10 @@ def process_meeting(meeting, type_info):
     # 5. Pull analysis fields
     qa_score = extract_qa_score(evaluations)
     doubt_text = get_note_value(notes, DOUBT_ANALOG_CATEGORY)
-    call_summary = get_note_value(notes, CALL_SUMMARY_ANALOG_CATEGORY)
+    # Call Summary = every parsed category concatenated, not just one
+    # section — see build_full_call_summary().
+    call_summary = build_full_call_summary(notes)
+    log(f"Call summary length: {len(call_summary)} chars across {len(notes)} categories", indent=1)
 
     # 6. Haiku enrichment
     log("Classifying Primary Objection (Haiku)...", indent=1)
