@@ -45,8 +45,17 @@ Required GitHub secrets:
   ANTHROPIC_API_KEY     Anthropic API key (for Claude Haiku enrichment)
 
 Optional env vars:
-  HOURS_BACK            Window of Avoma meetings to consider (default: 24)
-  DRY_RUN                If "1", log payloads without writing to Close
+  HOURS_BACK                  Window of Avoma meetings to consider (default: 24)
+  DRY_RUN                      If "1", log payloads without writing to Close
+  ALLOW_INCOMPLETE_ANALYSIS    If "1", create the Custom Activity even when
+                                Avoma analysis isn't ready yet, using only
+                                the fields available without it. Test-only
+                                — added 2026-09-04 while Avoma's call
+                                intelligence pipeline was stalled org-wide
+                                (pending a CSM reply on why). A CA created
+                                this way will NOT be auto-enriched later —
+                                the idempotency check sees it already
+                                exists once real analysis lands and skips.
 """
 
 import os
@@ -64,6 +73,7 @@ AVOMA_API_KEY = os.environ["AVOMA_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 HOURS_BACK = int(os.environ.get("HOURS_BACK", "24"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+ALLOW_INCOMPLETE_ANALYSIS = os.environ.get("ALLOW_INCOMPLETE_ANALYSIS", "0") == "1"
 
 CLOSE_API_BASE = "https://api.close.com/api/v1"
 AVOMA_API_BASE = "https://api.avoma.com/v1"
@@ -784,8 +794,17 @@ def process_meeting(meeting, type_info):
     notes = parse_avoma_notes(notes_raw)
     log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
     if not evaluations and not notes:
-        log("→ Avoma analysis not yet complete (no scorecard evaluations, no notes), skip", indent=1)
-        return ("skipped", "not-analyzed")
+        if not ALLOW_INCOMPLETE_ANALYSIS:
+            log("→ Avoma analysis not yet complete (no scorecard evaluations, no notes), skip", indent=1)
+            return ("skipped", "not-analyzed")
+        log(
+            "→ Avoma analysis not yet complete, but ALLOW_INCOMPLETE_ANALYSIS=1 — "
+            "proceeding with only the fields available now (round-trip test mode). "
+            "NOTE: this Custom Activity will NOT be auto-enriched later once real "
+            "analysis exists — the idempotency check will see it already exists "
+            "and skip creating an updated one. Test-only, not for the scheduled cron.",
+            indent=1,
+        )
     if not notes:
         log("Note: no parsed notes (likely setter-style scorecard or unrecognized notes shape); proceeding with scorecard-only fields", indent=1)
 
@@ -893,7 +912,10 @@ def process_meeting(meeting, type_info):
 
 # ===== Main =====
 def main():
-    section(f"Avoma → Close first-meeting sync (HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN})")
+    section(
+        f"Avoma → Close first-meeting sync (HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN}, "
+        f"ALLOW_INCOMPLETE_ANALYSIS={ALLOW_INCOMPLETE_ANALYSIS})"
+    )
 
     section("Resolving Close Custom Activity Type")
     type_info = find_custom_activity_type()
