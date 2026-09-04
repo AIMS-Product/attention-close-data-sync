@@ -41,7 +41,12 @@ in avoma-migration-rebuild-plan.md in the project docs):
    Analysis" CA type/fields.
 
 3. NOTES → FIELD MAPPING — Pain Points ≈ Doubt, Key Takeaways ≈ Call
-   Summary. UNVERIFIED against a real sales call.
+   Summary. CONFIRMED 2026-09-04: category names come through as real
+   header-2 block text (see parse_avoma_notes docstring for the full
+   shape). "Key Takeaways" is present on real calls; "Pain Points" isn't
+   guaranteed to exist on every call (e.g. a call with no discovery
+   objections) and will just come through blank in that case — expected,
+   not a bug.
 
 4. QA SCORE SHAPE — extract_qa_score()'s field-name guesses are unverified.
 
@@ -308,41 +313,69 @@ def _slate_node_text(node):
 
 
 def parse_avoma_notes(notes_response):
+    """
+    CONFIRMED 2026-09-04 against real analyzed calls (replaces the earlier
+    unverified assumption #3 guess). Avoma's /notes/ endpoint returns a
+    paginated envelope ({"count","next","previous","results"}); "results"
+    holds one (occasionally more) wrapper record(s), and the actual note
+    content is a FLAT Slate-style block list nested somewhere inside each
+    record (found dynamically via _find_block_list rather than a hardcoded
+    key path, since the exact wrapper key wasn't confirmed and may not be
+    stable). Blocks alternate: a "header-2"-type block whose extracted
+    text is the category name (e.g. "Key Takeaways", "Pain Points",
+    "Action Items" — real category names observed are broader than the
+    original NOTES_CATEGORY_ALIASES guesses, e.g. "Situational Analysis
+    (current vs desired state)", "Core desires & DBMs", "Gap Analysis"),
+    followed by one or more content blocks (typically "unordered-list")
+    whose extracted text is that category's content, until the next
+    header block.
+    """
     if not notes_response:
         return {}
 
-    items = notes_response
+    records = notes_response
     if isinstance(notes_response, dict):
-        items = (
+        records = (
             notes_response.get("results")
             or notes_response.get("data")
             or notes_response.get("notes")
             or []
         )
-        if isinstance(items, dict):
-            items = [{"category": k, "content": v} for k, v in items.items()]
+        if isinstance(records, dict):
+            records = [records]
+    if not isinstance(records, list):
+        return {}
+
+    # Gather the flat block list(s) — either the records ARE the blocks
+    # already (older/alternate shape), or the blocks are nested inside
+    # each wrapper record.
+    blocks = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("type") or record.get("object"):
+            blocks.append(record)
+            continue
+        nested = _find_block_list(record)
+        if nested:
+            blocks.extend(b for b in nested if isinstance(b, dict))
 
     out = {}
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        header = None
-        for key in ("category", "header", "title", "name", "label", "type"):
-            if item.get(key):
-                header = str(item[key]).strip()
-                break
-        if not header:
-            continue
-        content = None
-        for key in ("content", "children", "value", "body", "text", "notes"):
-            if key in item:
-                content = item[key]
-                break
-        text = _slate_node_text(content).strip()
+    current_category = None
+    for block in blocks:
+        btype = str(block.get("type") or block.get("object") or "").lower()
+        text = _slate_node_text(block.get("children")).strip()
         if not text:
             continue
-        canonical = NOTES_CATEGORY_ALIASES.get(header.lower(), header)
-        out[canonical] = (out[canonical] + "\n\n" + text).strip() if canonical in out else text
+        if btype.startswith("header"):
+            current_category = NOTES_CATEGORY_ALIASES.get(text.lower(), text)
+            continue
+        if current_category:
+            out[current_category] = (
+                (out[current_category] + "\n\n" + text).strip()
+                if current_category in out
+                else text
+            )
     return out
 
 
@@ -619,55 +652,26 @@ def enrich_call(close_call, type_info):
     notes_raw = avoma_get_notes(meeting_uuid)
     notes = parse_avoma_notes(notes_raw)
     log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
-    if notes_raw:
-        # DEBUG (assumption #3 unverified) — the raw JSON dump was too big
-        # and got truncated in the log. Instead, print a compact type+text
-        # sequence for every block so we can see where headings (category
-        # names) live in the structure vs. content blocks like "transcript".
-        debug_items = notes_raw
+    if notes_raw and not notes:
+        # Fallback debug — parsing shape is now confirmed (see
+        # parse_avoma_notes docstring), so this should no longer fire in
+        # normal operation. Left in place in case a call hits an edge case
+        # (e.g. a differently-shaped notes document) so it's diagnosable
+        # from the log rather than silently skipping.
+        log("⚠️  DEBUG: /notes/ returned data but parsed to 0 categories — dumping shape:", indent=1)
+        records = notes_raw
         if isinstance(notes_raw, dict):
-            debug_items = (
-                notes_raw.get("results")
-                or notes_raw.get("data")
-                or notes_raw.get("notes")
-                or []
-            )
-            if isinstance(debug_items, dict):
-                debug_items = [{"type": k, "children": v} for k, v in debug_items.items()]
-        log(f"DEBUG: /notes/ top-level type: {type(notes_raw).__name__}"
-            + (f", dict keys: {list(notes_raw.keys())}" if isinstance(notes_raw, dict) else ""), indent=1)
-        log(f"DEBUG: {len(debug_items) if isinstance(debug_items, list) else '?'} result record(s)", indent=1)
-        if isinstance(debug_items, list):
-            for ri, record in enumerate(debug_items[:10]):
+            records = notes_raw.get("results") or notes_raw.get("data") or notes_raw.get("notes") or []
+            if isinstance(records, dict):
+                records = [records]
+        if isinstance(records, list):
+            for ri, record in enumerate(records[:5]):
                 if not isinstance(record, dict):
-                    log(f"  [{ri}] (non-dict record: {type(record).__name__})", indent=2)
                     continue
-                # A record IS itself a block (has type/children at top level)
-                if record.get("type") or record.get("object"):
-                    itype = record.get("type") or record.get("object") or "?"
-                    text_preview = _slate_node_text(record.get("children")).strip().replace("\n", " ")[:70]
-                    log(f"  [{ri}] type={itype!r} text={text_preview!r}", indent=2)
-                    continue
-                # Otherwise it's a wrapper record — show its shape, then
-                # hunt for the nested block list inside it.
-                log(f"  [{ri}] record top-level keys: {sorted(record.keys())}", indent=2)
-                for k, v in record.items():
-                    if isinstance(v, (list, dict, str)):
-                        log(f"      {k}: {type(v).__name__} (len={len(v)})", indent=3)
-                    else:
-                        log(f"      {k}: {v!r}", indent=3)
-                blocks = _find_block_list(record)
+                log(f"  [{ri}] keys: {sorted(record.keys())}", indent=2)
+                blocks = _find_block_list(record) if not (record.get("type") or record.get("object")) else None
                 if blocks:
-                    log(f"  [{ri}] found {len(blocks)} nested block(s) — type + text preview:", indent=2)
-                    for i, item in enumerate(blocks[:150]):
-                        if not isinstance(item, dict):
-                            continue
-                        itype = item.get("type") or item.get("object") or "?"
-                        data_keys = list(item.get("data", {}).keys()) if isinstance(item.get("data"), dict) else None
-                        text_preview = _slate_node_text(item.get("children")).strip().replace("\n", " ")[:70]
-                        log(f"      [{i}] type={itype!r} data_keys={data_keys} text={text_preview!r}", indent=3)
-                else:
-                    log(f"  [{ri}] could not auto-locate a nested block list", indent=2)
+                    log(f"  [{ri}] nested block types: {[b.get('type') or b.get('object') for b in blocks[:40]]}", indent=2)
     analysis_incomplete = not evaluations and not notes
     if analysis_incomplete:
         if not ALLOW_INCOMPLETE_ANALYSIS:
