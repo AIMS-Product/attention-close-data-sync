@@ -56,22 +56,20 @@ avoma-migration-rebuild-plan.md in the project docs):
    fail. CONFIRMED 2026-09-03 (first real workflow run, fixed after a
    crash): `GET /v1/users/` returns a bare JSON list, NOT the
    `{"results": [...], "next": ...}` paginated envelope every other listed
-   endpoint uses — handled defensively now. Still UNVERIFIED: whether that
-   list distinguishes "invited, not yet accepted" from "active" — if
-   invited-but-not-accepted users show up in it, the gate will
-   under-filter (a rep who looks seated but hasn't actually accepted their
-   invite) and you'll see the same 400 from Avoma downstream; tighten the
-   filter in `avoma_build_active_user_emails` if that happens.
+   endpoint uses.
 
-   **2026-09-03, second dry run: gate returned 0 Avoma users, skipping
-   100% of 35 eligible calls.** Every call was skipped at this gate — not
-   a partial under-seating issue, a total one. Since the script didn't
-   raise (it only raises on a non-2xx response), `GET /v1/users/` returned
-   HTTP 200 with something that parsed to zero usable entries — either a
-   genuinely empty list, or a shape `avoma_build_active_user_emails`
-   isn't handling. Added a debug branch below (see the `page_count == 0`
-   block) to print the raw response shape/preview next run instead of
-   guessing further.
+   **CONFIRMED 2026-09-04 — root cause of two subsequent dry runs both
+   returning "Loaded 0 Avoma users" despite real users existing.** Each
+   entry in that bare list is a *membership* record, not a flat user
+   object — `email`, name fields, and `is_active` all live nested under
+   `entry["user"]`, e.g. `{"uuid": ..., "user": {"email": "adam@...",
+   "is_active": true, ...}, "role": {...}, "teams": [...]}`. The original
+   parser read `entry.get("email")` directly and silently got nothing
+   back on every one of 33 real entries. Fixed by reading
+   `entry["user"]["email"]` (with a same-shape fallback for
+   forward-compat). This also resolves the "invited vs. active" question
+   below — `entry["user"]["is_active"]` is exactly that signal, now
+   gated on directly instead of being left unverified.
 
 3. **`participants` payload shape** — UNVERIFIED. The handoff doc confirms
    `POST /v1/calls/` accepts a `participants` field but not its exact
@@ -291,10 +289,7 @@ def avoma_post(path, json_data):
 def avoma_build_active_user_emails():
     """
     Return a set of Avoma user emails (lowercased) to gate `POST /v1/calls/`
-    against. See assumption #2 — the exact "active vs. invited" distinction
-    in the response is unconfirmed; this includes every user the endpoint
-    returns. Tighten if invited-but-not-accepted users turn out to be
-    included and you start seeing 400s despite passing this gate.
+    against.
 
     CONFIRMED 2026-09-03 (first real workflow run): unlike /v1/meetings/ and
     /v1/scorecard_evaluations/, GET /v1/users/ does NOT use the
@@ -302,24 +297,26 @@ def avoma_build_active_user_emails():
     JSON list. Handled defensively below in case that ever changes (or
     differs across pages) without needing another fix.
 
-    2026-09-03, second and third dry runs: this returned 0 emails twice in
-    a row, gating out every eligible call both times. A first debug pass
-    (checking whether the parsed page list itself was empty) did NOT fire
-    on the third run — meaning `/v1/users/` is very likely returning real,
-    non-empty user records, just not under an `email` key this parser
-    recognizes (could be `work_email`, `primary_email`, nested under
-    another key, etc.), so every user silently fails the `u.get("email")`
-    check and the set ends up empty regardless of how many users actually
-    exist. Reworked the debug block below accordingly: it now tracks the
-    raw entry count across all pages and, if the final email set is still
-    empty, logs the first raw user record so we can see its actual field
-    names. Remove once the root cause is confirmed and fixed.
+    CONFIRMED 2026-09-04 — root cause of "Loaded 0 Avoma users" on two
+    prior dry runs: each entry in that bare list is a *membership* record,
+    not a flat user object. `email`, name fields, and `is_active` all live
+    nested under `entry["user"]`:
+
+        {"uuid": "...", "user": {"email": "adam@modern-amenities.com",
+         "is_active": true, ...}, "role": {...}, "teams": [...]}
+
+    The original parser read `entry.get("email")` directly and silently
+    got nothing back on all 33 real entries. Now reads
+    `entry["user"]["email"]` (flat `entry.get("email")` kept as a
+    fallback in case this shape ever reverts). `entry["user"]["is_active"]`
+    is also confirmed real and is used to gate directly — this resolves
+    the previously-open "invited vs. actually active" question: an entry
+    with `is_active: false` is excluded rather than included.
     """
     emails = set()
+    skipped_inactive = 0
     url = "/users/"
     params = {"page_size": 100}
-    total_raw_entries = 0
-    first_raw_entry = None
     for _ in range(50):
         resp = avoma_get(url, params=params)
         if not resp.ok:
@@ -333,32 +330,26 @@ def avoma_build_active_user_emails():
             users = body.get("results", [])
             next_url = body.get("next")
 
-        total_raw_entries += len(users)
-        if first_raw_entry is None and users:
-            first_raw_entry = users[0]
-
-        for u in users:
-            email = (u.get("email") or "").lower().strip()
-            if email:
-                emails.add(email)
+        for entry in users:
+            # CONFIRMED 2026-09-04: email/is_active are nested under
+            # entry["user"], not on entry itself — see docstring above.
+            nested_user = entry.get("user") or {}
+            email = (nested_user.get("email") or entry.get("email") or "").lower().strip()
+            if not email:
+                continue
+            is_active = nested_user.get("is_active", True)
+            if is_active is False:
+                skipped_inactive += 1
+                continue
+            emails.add(email)
 
         if not next_url:
             break
         url = next_url
         params = None
 
-    # DEBUG — temporary, added 2026-09-03 after two dry runs in a row
-    # returned 0 usable Avoma users org-wide despite the request itself
-    # succeeding. Tells us definitively whether /v1/users/ is genuinely
-    # empty (first_raw_entry stays None) or has real entries under an
-    # unrecognized email field (sample entry printed below).
-    if not emails:
-        log(
-            f"⚠️  DEBUG: /v1/users/ returned {total_raw_entries} raw "
-            f"entries across all pages but 0 usable emails. "
-            f"{'Sample entry: ' + json.dumps(first_raw_entry)[:800] if first_raw_entry else '(no entries returned at all — genuinely empty)'}",
-            indent=1,
-        )
+    if skipped_inactive:
+        log(f"({skipped_inactive} Avoma membership record(s) excluded: is_active=false)", indent=1)
 
     return emails
 
