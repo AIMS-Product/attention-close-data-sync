@@ -33,18 +33,38 @@ before handing that URL to Avoma.
 READ THIS FIRST — status and assumptions (full write-up in
 avoma-migration-rebuild-plan.md in the project docs):
 
-1. **RECORDING STORAGE BACKEND — RESOLVED 2026-09-03.** S3 bucket
-   `vp-avoma-recordings` (Ohio / us-east-2), with a dedicated IAM user
-   (`avoma-recording-uploader`) scoped to `s3:PutObject`/`s3:GetObject` on
-   just that bucket — not Stephen's own admin credentials. Bucket keeps
-   "Block all public access" ON; `upload_recording_and_get_public_url()`
-   uploads the MP3 and hands back a presigned GET URL instead of relying
-   on a public bucket policy. Needs `boto3` in the workflow's `pip
-   install` step (added — see close_to_avoma_sync.yml) and
+1. **RECORDING STORAGE BACKEND — RESOLVED 2026-09-03, CONFIRMED WORKING
+   2026-09-04.** S3 bucket `vp-avoma-recordings` (Ohio / us-east-2), with a
+   dedicated IAM user (`avoma-recording-uploader`) scoped to
+   `s3:PutObject`/`s3:GetObject` on just that bucket — not Stephen's own
+   admin credentials. Bucket keeps "Block all public access" ON;
+   `upload_recording_and_get_public_url()` uploads the MP3 and hands back
+   a presigned GET URL instead of relying on a public bucket policy. Needs
+   `boto3` in the workflow's `pip install` step (added — see
+   close_to_avoma_sync.yml) and
    `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION` as
    GitHub secrets (boto3 reads these from the environment automatically).
-   UNVERIFIED: this hasn't been run end-to-end against a real Close call
-   yet — first non-DRY_RUN run should be watched closely.
+   First real (non-DRY_RUN) run 2026-09-04 confirmed both the download
+   from Close and the S3 upload/presign succeed against real calls
+   (3.2MB and 1.6MB MP3s, both re-hosted with a valid presigned URL). The
+   actual `POST /v1/calls/` on that run failed — see finding #2a below —
+   so Avoma successfully *fetching* a presigned URL is still unconfirmed;
+   next real run should confirm that once #2a's fix is in.
+
+2a. **`POST /v1/calls/` requires `frm`, `to`, and `start_at` —
+   CONFIRMED REQUIRED 2026-09-04**, first real run against two live Close
+   calls: both got `400: {"frm":["This field is required."],
+   "to":["This field is required."],"start_at":["This field is
+   required."]}`. Not mentioned in Adam's handoff, and not exercised by
+   the 8/28 end-to-end test (that one apparently sent a fuller payload
+   than this script was built with). Fixed by adding
+   `close_extract_call_endpoints()`, which derives `frm`/`to` from Close's
+   `local_phone`/`remote_phone` fields oriented by the call's `direction`,
+   and `start_at` from Close's `date_created` (already used elsewhere in
+   this script as the call's timestamp). **UNVERIFIED**: the
+   local_phone/remote_phone field-name guess itself — if wrong, a debug
+   line logs every phone-like field on the call so the real names can be
+   read off directly. Not yet re-tested.
 
 2. **Avoma-user gate** (`avoma_build_active_user_emails`) — CONFIRMED
    NECESSARY: `POST /v1/calls/` rejects any `user_email` that isn't an
@@ -250,6 +270,46 @@ def close_get_user_email(user_id):
         name = " ".join(p for p in (data.get("first_name"), data.get("last_name")) if p) or None
         return email, name
     return None, None
+
+
+def close_extract_call_endpoints(call):
+    """
+    Best-guess mapping onto Avoma's `POST /v1/calls/` required `frm`/`to`
+    fields — CONFIRMED REQUIRED 2026-09-04 (first real run against real
+    Close calls; not mentioned in Adam's handoff, and not exercised by the
+    8/28 end-to-end test, which apparently sent a fuller payload than this
+    script currently builds). Close's Call Activity object exposes
+    `local_phone` (the org/rep-side number) and `remote_phone` (the
+    counterparty's number) independent of call direction; frm/to are
+    derived by orienting those against the call's own `direction`.
+
+    UNVERIFIED — Close's exact field names for these phone numbers haven't
+    been independently confirmed against a raw payload (this script reads
+    `/activity/call/` with no `_fields` filter, so whatever Close returns
+    by default is what's available; `local_phone`/`remote_phone` is the
+    standard Close Call Activity schema, but hasn't been eyeballed
+    directly here). If frm or to comes back empty, a debug dump of every
+    phone-like field on the call is logged so the real field name can be
+    read off directly instead of guessing again.
+    """
+    direction = call.get("direction") or DEFAULT_DIRECTION
+    local_phone = call.get("local_phone")
+    remote_phone = call.get("remote_phone") or call.get("phone")
+
+    if direction == "inbound":
+        frm, to = remote_phone, local_phone
+    else:
+        frm, to = local_phone, remote_phone
+
+    if not frm or not to:
+        phone_like = {k: v for k, v in call.items() if "phone" in k.lower()}
+        log(
+            f"⚠️  DEBUG: could not resolve frm/to from local_phone/remote_phone — "
+            f"phone-like fields on this call: {json.dumps(phone_like)}",
+            indent=1,
+        )
+
+    return frm, to
 
 
 # ===== Avoma API =====
@@ -538,6 +598,19 @@ def import_call(call, avoma_user_emails, user_info_cache):
 
     direction = call.get("direction") or DEFAULT_DIRECTION
 
+    # 3b. frm/to/start_at — CONFIRMED REQUIRED 2026-09-04 (see
+    # close_extract_call_endpoints docstring). Computed from data already
+    # on the call object, so this is checked (and shown in DRY_RUN
+    # previews) before any download/upload happens — no point burning a
+    # real S3 upload on a payload we already know Avoma will 400 on.
+    frm, to = close_extract_call_endpoints(call)
+    start_at = call.get("date_created")
+    log(f"Call endpoints: frm={frm!r}, to={to!r}, start_at={start_at!r}", indent=1)
+
+    if not frm or not to or not start_at:
+        log(f"→ Missing required frm/to/start_at for Avoma's POST /v1/calls/, skip", indent=1)
+        return None
+
     if DRY_RUN:
         log("→ DRY_RUN, not downloading/uploading/importing", indent=1)
         preview_payload = {
@@ -547,6 +620,9 @@ def import_call(call, avoma_user_emails, user_info_cache):
             "participants": participants,
             "direction": direction,
             "source": SOURCE_VALUE,
+            "frm": frm,
+            "to": to,
+            "start_at": start_at,
         }
         if ATTACH_CRM_ASSOCIATION and call.get("lead_id"):
             preview_payload["crm_association"] = [
@@ -575,6 +651,9 @@ def import_call(call, avoma_user_emails, user_info_cache):
         "participants": participants,
         "direction": direction,
         "source": SOURCE_VALUE,
+        "frm": frm,
+        "to": to,
+        "start_at": start_at,
     }
     if ATTACH_CRM_ASSOCIATION and call.get("lead_id"):
         payload["crm_association"] = [
