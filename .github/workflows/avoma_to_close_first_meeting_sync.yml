@@ -21,6 +21,10 @@ on:
         description: 'Dry run (1 = log payloads without writing to Close)'
         required: false
         default: '0'
+      allow_incomplete_analysis:
+        description: 'Round-trip test mode (1 = create the Custom Activity even if Avoma analysis is not ready yet — test only, not for the schedule)'
+        required: false
+        default: '0'
 
 concurrency:
   group: avoma-to-close-first-meeting-sync
@@ -50,4 +54,5 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           HOURS_BACK: ${{ inputs.hours_back || '24' }}
           DRY_RUN: ${{ inputs.dry_run || '0' }}
+          ALLOW_INCOMPLETE_ANALYSIS: ${{ inputs.allow_incomplete_analysis || '0' }}
         run: python3 -u avoma_to_close_first_meeting_sync.py
