@@ -46,6 +46,30 @@ in avoma-migration-rebuild-plan.md in the project docs):
 4. QA SCORE SHAPE — extract_qa_score()'s field-name guesses are unverified.
 
 5. AVOMA WEB LINK FORMAT — assumed https://app.avoma.com/meetings/{uuid}.
+   CONFIRMED CORRECT 2026-09-04 against a real close_to_avoma_sync.py
+   import (Stephen verified the URL in the Avoma UI).
+
+6. ANALYSIS-COMPLETENESS GATE (`ALLOW_INCOMPLETE_ANALYSIS`) — 2026-09-04.
+   By default this script waits for Avoma analysis (scorecard evaluations
+   or notes) to exist before creating a Custom Activity at all, retrying
+   on the next hourly run otherwise — intentional, so a CA isn't created
+   half-empty and then never revisited (the idempotency check below only
+   confirms a CA exists for a given meeting_uuid; it doesn't update one).
+   Discovered 2026-09-04 that a Close rep being "active" in Avoma
+   (`is_active: true` on their membership) does NOT mean they've logged
+   in — Joseph/"Joe Vaughan" is seated and his calls import fine via
+   close_to_avoma_sync.py, but Avoma hasn't generated any notes/scorecard
+   for them yet because he hasn't logged in, so this script would
+   otherwise skip his calls indefinitely. Set `ALLOW_INCOMPLETE_ANALYSIS=1`
+   to bypass that gate for a one-off round-trip test: it still creates the
+   Custom Activity, populating only the fields that don't depend on Avoma
+   AI processing (call link, meeting UUID, title, duration, the Close call
+   activity ID link-back) and leaving QA Score/Primary Objection/Key
+   Concern/Lost Reason/Call Summary blank. **This is a test-only escape
+   hatch, not meant for the scheduled cron** — a CA created this way will
+   never be enriched later, since the idempotency check will see it
+   already exists and skip creating an updated one once real analysis
+   becomes available.
 ============================================================================
 
 Required GitHub secrets:
@@ -54,9 +78,13 @@ Required GitHub secrets:
   ANTHROPIC_API_KEY     Anthropic API key (for Claude Haiku enrichment)
 
 Optional env vars:
-  HOURS_BACK            Window of recent Close calls to consider (default: 24)
-  MIN_DURATION          Skip Close calls shorter than this in seconds (default: 180)
-  DRY_RUN                If "1", log payloads without writing to Close
+  HOURS_BACK                  Window of recent Close calls to consider (default: 24)
+  MIN_DURATION                 Skip Close calls shorter than this in seconds (default: 180)
+  DRY_RUN                      If "1", log payloads without writing to Close
+  ALLOW_INCOMPLETE_ANALYSIS    If "1", create the Custom Activity even when
+                                Avoma analysis isn't ready yet, using only
+                                the fields available without it. Test-only
+                                — see assumption #6 above.
 """
 
 import os
@@ -75,6 +103,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 HOURS_BACK = int(os.environ.get("HOURS_BACK", "24"))
 MIN_DURATION = int(os.environ.get("MIN_DURATION", "180"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+ALLOW_INCOMPLETE_ANALYSIS = os.environ.get("ALLOW_INCOMPLETE_ANALYSIS", "0") == "1"
 
 CLOSE_API_BASE = "https://api.close.com/api/v1"
 AVOMA_API_BASE = "https://api.avoma.com/v1"
@@ -528,9 +557,10 @@ def custom_activity_already_exists(lead_id, type_id, avoma_meeting_uuid, call_id
 def enrich_call(close_call, type_info):
     """
     Process one Close call: look up its Avoma call resource by external_id,
-    resolve the linked meeting, and if analysis is complete, create a
-    Custom Activity on the matched lead. Returns the new Custom Activity
-    ID, or None if skipped for any reason.
+    resolve the linked meeting, and if analysis is complete (or
+    ALLOW_INCOMPLETE_ANALYSIS is set — see assumption #6), create a Custom
+    Activity on the matched lead. Returns the new Custom Activity ID, or
+    None if skipped for any reason.
     """
     call_id = close_call["id"]
     duration = close_call.get("duration") or 0
@@ -564,11 +594,21 @@ def enrich_call(close_call, type_info):
     evaluations = avoma_get_scorecard_evaluations(meeting_uuid)
     notes_raw = avoma_get_notes(meeting_uuid)
     notes = parse_avoma_notes(notes_raw)
-    if not evaluations and not notes:
-        log("→ Avoma analysis not yet complete, skip (will retry next run)", indent=1)
-        log(f"  scorecard evaluations: {len(evaluations)}, parsed notes categories: {len(notes)}", indent=2)
-        return None
-    if not notes:
+    analysis_incomplete = not evaluations and not notes
+    if analysis_incomplete:
+        if not ALLOW_INCOMPLETE_ANALYSIS:
+            log("→ Avoma analysis not yet complete, skip (will retry next run)", indent=1)
+            log(f"  scorecard evaluations: {len(evaluations)}, parsed notes categories: {len(notes)}", indent=2)
+            return None
+        log(
+            "→ Avoma analysis not yet complete, but ALLOW_INCOMPLETE_ANALYSIS=1 — "
+            "proceeding with only the fields available now (round-trip test mode). "
+            "NOTE: this Custom Activity will NOT be auto-enriched later once real "
+            "analysis exists — the idempotency check will see it already exists "
+            "and skip creating an updated one. Test-only, not for the scheduled cron.",
+            indent=1,
+        )
+    elif not notes:
         log("Note: no parsed notes (likely setter-style scorecard or unrecognized notes shape); proceeding with scorecard-only fields", indent=1)
 
     # 3. Idempotency check
@@ -581,12 +621,14 @@ def enrich_call(close_call, type_info):
         log("→ Custom Activity already exists for this meeting, skip", indent=1)
         return None
 
-    # 4. Pull analysis fields
+    # 4. Pull analysis fields (blank/None when analysis isn't ready)
     qa_score = extract_qa_score(evaluations)
     doubt_text = get_note_value(notes, DOUBT_ANALOG_CATEGORY)
     call_summary = get_note_value(notes, CALL_SUMMARY_ANALOG_CATEGORY)
 
-    # 5. Claude Haiku enrichment
+    # 5. Claude Haiku enrichment (each function already no-ops on empty
+    #    input, so this is safe to call unconditionally even in
+    #    round-trip test mode — it just returns "Other"/"" immediately)
     log("Classifying Primary Objection (Haiku)...", indent=1)
     primary_objection = haiku_classify_objection(doubt_text)
     log(f"→ {primary_objection}", indent=2)
@@ -605,7 +647,7 @@ def enrich_call(close_call, type_info):
         log(f"→ {lost_reason[:120]}", indent=2)
 
     # 6. Build Custom Activity payload
-    avoma_link = f"https://app.avoma.com/meetings/{meeting_uuid}"  # ASSUMPTION — unconfirmed URL format
+    avoma_link = f"https://app.avoma.com/meetings/{meeting_uuid}"  # CONFIRMED CORRECT 2026-09-04
     field_mapping = {
         CLOSE_FIELD_NAMES["call_link"]: avoma_link,
         CLOSE_FIELD_NAMES["call_id"]: meeting_uuid,
@@ -646,7 +688,8 @@ def enrich_call(close_call, type_info):
 def main():
     section(
         f"Avoma → Close dialer call enrichment "
-        f"(HOURS_BACK={HOURS_BACK}, MIN_DURATION={MIN_DURATION}s, DRY_RUN={DRY_RUN})"
+        f"(HOURS_BACK={HOURS_BACK}, MIN_DURATION={MIN_DURATION}s, DRY_RUN={DRY_RUN}, "
+        f"ALLOW_INCOMPLETE_ANALYSIS={ALLOW_INCOMPLETE_ANALYSIS})"
     )
 
     section("Resolving Close Custom Activity Type")
