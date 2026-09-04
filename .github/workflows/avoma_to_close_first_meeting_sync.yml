@@ -1,16 +1,23 @@
 name: Avoma → Close First Meeting Sync
 
 on:
-  schedule:
-    # Hourly at :05, scheduled AFTER:
-    #   :00 - sync.py                                  (first sales → lead fields)
-    # and BEFORE:
-    #   :15 - close_to_avoma_sync.py                    (Close dialer → Avoma)
-    #   :30 - avoma_to_close_dialer_sync.py              (dialer analyses → Close CA)
-    #   :45 - avoma_to_close_meeting_sync.py             (everything else → Close CA)
-    # Idempotent on Attention Call ID (stores the Avoma meeting UUID), so
-    # late arrivals get picked up next hour.
-    - cron: '5 * * * *'
+  # Schedule intentionally disabled 2026-09-04 while the Avoma rebuild is
+  # being rolled out — Stephen wants to avoid duplicate Custom Activity
+  # records in Close while both the Attention and Avoma pipelines could
+  # otherwise run against the same data. The Attention-based scripts stay
+  # on their existing schedule. Re-enable by uncommenting the `schedule:`
+  # block below once Stephen confirms. Manual runs still work via
+  # workflow_dispatch in the meantime.
+  # schedule:
+  #   # Hourly at :05, scheduled AFTER:
+  #   #   :00 - sync.py                                  (first sales → lead fields)
+  #   # and BEFORE:
+  #   #   :15 - close_to_avoma_sync.py                    (Close dialer → Avoma)
+  #   #   :30 - avoma_to_close_dialer_sync.py              (dialer analyses → Close CA)
+  #   #   :45 - avoma_to_close_meeting_sync.py             (everything else → Close CA)
+  #   # Idempotent on Attention Call ID (stores the Avoma meeting UUID), so
+  #   # late arrivals get picked up next hour.
+  #   - cron: '5 * * * *'
   workflow_dispatch:
     inputs:
       hours_back:
