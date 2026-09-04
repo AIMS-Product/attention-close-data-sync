@@ -589,11 +589,19 @@ def enrich_call(close_call, type_info):
     title = meeting.get("subject", "")
     log(f"Avoma meeting: {meeting_uuid}", indent=1)
     log(f"Subject:       {title!r}", indent=1)
+    log(f"Meeting object keys: {sorted(meeting.keys())}", indent=2)
 
     # 2. Check processing completeness
     evaluations = avoma_get_scorecard_evaluations(meeting_uuid)
     notes_raw = avoma_get_notes(meeting_uuid)
     notes = parse_avoma_notes(notes_raw)
+    log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
+    if notes_raw:
+        # DEBUG (assumption #3 unverified) — dump the raw /notes/ shape so we
+        # can see why expected categories (Pain Points / Key Takeaways) are
+        # or aren't coming through. Remove once mapping is confirmed.
+        log("DEBUG: raw /notes/ response (up to 3000 chars):", indent=1)
+        log(json.dumps(notes_raw, indent=2)[:3000], indent=2)
     analysis_incomplete = not evaluations and not notes
     if analysis_incomplete:
         if not ALLOW_INCOMPLETE_ANALYSIS:
