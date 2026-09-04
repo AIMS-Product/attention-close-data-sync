@@ -350,6 +350,29 @@ def get_note_value(notes_dict, category_name):
     return notes_dict.get(category_name, "")
 
 
+def _find_block_list(obj, depth=0, max_depth=6):
+    """DEBUG helper (assumption #3) — hunt for a nested list of Slate-style
+    blocks (dicts with a "type" key) inside an arbitrarily-nested /notes/
+    record, so we can inspect its shape without guessing the exact key
+    path up front."""
+    if depth > max_depth:
+        return None
+    if isinstance(obj, list) and obj and all(isinstance(x, dict) for x in obj[:5]):
+        if any(("type" in x or "object" in x) for x in obj[:5]):
+            return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_block_list(v, depth + 1, max_depth)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_block_list(v, depth + 1, max_depth)
+            if found:
+                return found
+    return None
+
+
 def extract_qa_score(evaluations):
     """UNVERIFIED SHAPE (see assumption #4)."""
     if not evaluations:
@@ -613,16 +636,38 @@ def enrich_call(close_call, type_info):
                 debug_items = [{"type": k, "children": v} for k, v in debug_items.items()]
         log(f"DEBUG: /notes/ top-level type: {type(notes_raw).__name__}"
             + (f", dict keys: {list(notes_raw.keys())}" if isinstance(notes_raw, dict) else ""), indent=1)
-        log(f"DEBUG: {len(debug_items) if isinstance(debug_items, list) else '?'} block(s) — type + text preview:", indent=1)
+        log(f"DEBUG: {len(debug_items) if isinstance(debug_items, list) else '?'} result record(s)", indent=1)
         if isinstance(debug_items, list):
-            for i, item in enumerate(debug_items[:150]):
-                if not isinstance(item, dict):
-                    log(f"  [{i}] (non-dict item: {type(item).__name__})", indent=2)
+            for ri, record in enumerate(debug_items[:10]):
+                if not isinstance(record, dict):
+                    log(f"  [{ri}] (non-dict record: {type(record).__name__})", indent=2)
                     continue
-                itype = item.get("type") or item.get("object") or "?"
-                data_keys = list(item.get("data", {}).keys()) if isinstance(item.get("data"), dict) else None
-                text_preview = _slate_node_text(item.get("children")).strip().replace("\n", " ")[:70]
-                log(f"  [{i}] type={itype!r} data_keys={data_keys} text={text_preview!r}", indent=2)
+                # A record IS itself a block (has type/children at top level)
+                if record.get("type") or record.get("object"):
+                    itype = record.get("type") or record.get("object") or "?"
+                    text_preview = _slate_node_text(record.get("children")).strip().replace("\n", " ")[:70]
+                    log(f"  [{ri}] type={itype!r} text={text_preview!r}", indent=2)
+                    continue
+                # Otherwise it's a wrapper record — show its shape, then
+                # hunt for the nested block list inside it.
+                log(f"  [{ri}] record top-level keys: {sorted(record.keys())}", indent=2)
+                for k, v in record.items():
+                    if isinstance(v, (list, dict, str)):
+                        log(f"      {k}: {type(v).__name__} (len={len(v)})", indent=3)
+                    else:
+                        log(f"      {k}: {v!r}", indent=3)
+                blocks = _find_block_list(record)
+                if blocks:
+                    log(f"  [{ri}] found {len(blocks)} nested block(s) — type + text preview:", indent=2)
+                    for i, item in enumerate(blocks[:150]):
+                        if not isinstance(item, dict):
+                            continue
+                        itype = item.get("type") or item.get("object") or "?"
+                        data_keys = list(item.get("data", {}).keys()) if isinstance(item.get("data"), dict) else None
+                        text_preview = _slate_node_text(item.get("children")).strip().replace("\n", " ")[:70]
+                        log(f"      [{i}] type={itype!r} data_keys={data_keys} text={text_preview!r}", indent=3)
+                else:
+                    log(f"  [{ri}] could not auto-locate a nested block list", indent=2)
     analysis_incomplete = not evaluations and not notes
     if analysis_incomplete:
         if not ALLOW_INCOMPLETE_ANALYSIS:
