@@ -28,16 +28,20 @@ docs for the full write-up):
 
 2. NOTES → FIELD MAPPING (NOTES_CATEGORY_ALIASES, DOUBT_ANALOG_CATEGORY,
    CALL_SUMMARY_ANALOG_CATEGORY, DEAL_SUMMARY_ANALOG_CATEGORY below):
-   Avoma's /v1/notes/ endpoint returns a nested Slate.js-style rich-text
-   tree grouped under category headers (Participants, Key Takeaways,
-   Action Items, Follow-up Meeting, Pain Points, Features Interested,
-   Positive Moments, Timeline) instead of Attention's flat
-   extractedIntelligence dict. This was only verified against Adam's toy
-   demo meeting, not a real sales call — the header list and the parser
-   below (parse_avoma_notes) both need re-validation once real call notes
-   exist. Best first-pass guess: Pain Points ≈ Attention's "Doubt" field,
-   Key Takeaways ≈ "Call Summary". Attention's "Money/Finances" and
-   "Why Now?" have no obvious Avoma analog yet.
+   CONFIRMED 2026-09-04 (via avoma_to_close_dialer_sync.py, which hit the
+   same /v1/notes/ endpoint against real analyzed calls, replacing the
+   earlier "Adam's toy demo meeting" guess). Avoma's /v1/notes/ endpoint
+   returns a paginated envelope whose "results" holds a wrapper record
+   containing a FLAT Slate-style block list: "header-2" blocks name each
+   category (Participants, Key Takeaways, Action Items, Pain Points, plus
+   many call-specific categories that vary per call — e.g. "Situational
+   Analysis", "Gap Analysis"), followed by content blocks until the next
+   header. parse_avoma_notes() now walks this real shape. Call Summary is
+   now every parsed category concatenated (see build_full_call_summary),
+   not just "Key Takeaways" alone. Pain Points ≈ Attention's "Doubt"
+   field — not guaranteed on every call (comes through blank when a call
+   has no discovery objections, which is expected, not a bug). Attention's
+   "Money/Finances" and "Why Now?" still have no obvious Avoma analog.
 
 3. QA SCORE SHAPE (extract_qa_score below): /v1/scorecard_evaluations/ has
    only been observed as an empty result set — no live scorecard has
@@ -67,8 +71,17 @@ Required GitHub secrets:
   ANTHROPIC_API_KEY     Anthropic API key (for Claude Haiku enrichment)
 
 Optional env vars:
-  HOURS_BACK            Window of Avoma meetings to consider (default: 24)
-  DRY_RUN                If "1", log payloads without writing to Close
+  HOURS_BACK                  Window of Avoma meetings to consider (default: 24)
+  DRY_RUN                      If "1", log payloads without writing to Close
+  ALLOW_INCOMPLETE_ANALYSIS    If "1", create the Custom Activity even when
+                                Avoma analysis isn't ready yet, using only
+                                the fields available without it. Test-only
+                                — added 2026-09-04 while Avoma's call
+                                intelligence pipeline was stalled org-wide
+                                (pending a CSM reply on why). A CA created
+                                this way will NOT be auto-enriched later —
+                                the idempotency check sees it already
+                                exists once real analysis lands and skips.
 """
 
 import os
@@ -86,6 +99,7 @@ AVOMA_API_KEY = os.environ["AVOMA_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 HOURS_BACK = int(os.environ.get("HOURS_BACK", "24"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+ALLOW_INCOMPLETE_ANALYSIS = os.environ.get("ALLOW_INCOMPLETE_ANALYSIS", "0") == "1"
 
 CLOSE_API_BASE = "https://api.close.com/api/v1"
 AVOMA_API_BASE = "https://api.avoma.com/v1"
@@ -352,7 +366,7 @@ def avoma_get_meeting_segments(meeting_uuid):
     return resp.json()
 
 
-# ===== Avoma notes parsing (assumption #2 — see module docstring) =====
+# ===== Avoma notes parsing (assumption #2 — CONFIRMED 2026-09-04, see below) =====
 def _slate_node_text(node):
     """Recursively pull plain text out of a Slate.js-style node/tree."""
     if node is None:
@@ -360,7 +374,14 @@ def _slate_node_text(node):
     if isinstance(node, str):
         return node
     if isinstance(node, list):
-        return "".join(_slate_node_text(n) for n in node)
+        # Join with a space, not "" — sibling nodes at this level are
+        # usually distinct text runs or nested sub-items (e.g. a bullet's
+        # own text followed by a nested sub-list), and joining with no
+        # separator glues them into unreadable run-ons like "JosephResend
+        # the proposal..." (confirmed against a real avoma_to_close_dialer_
+        # sync.py payload 2026-09-04, same underlying bug here).
+        parts = [_slate_node_text(n) for n in node]
+        return " ".join(p for p in parts if p)
     if isinstance(node, dict):
         if isinstance(node.get("text"), str):
             return node["text"]
@@ -370,53 +391,118 @@ def _slate_node_text(node):
     return ""
 
 
+def _slate_block_to_lines(children):
+    """Extract one text line per top-level child of a content block,
+    instead of flattening the whole block into one run-on string."""
+    if not isinstance(children, list):
+        text = _slate_node_text(children).strip()
+        return [text] if text else []
+    lines = []
+    for child in children:
+        text = _slate_node_text(child).strip()
+        if text:
+            lines.append(text)
+    return lines
+
+
+def _find_block_list(obj, depth=0, max_depth=6):
+    """Hunt for a nested list of Slate-style blocks (dicts with a "type"
+    key) inside an arbitrarily-nested /notes/ record, so we don't depend
+    on a hardcoded key path that might not be stable."""
+    if depth > max_depth:
+        return None
+    if isinstance(obj, list) and obj and all(isinstance(x, dict) for x in obj[:5]):
+        if any(("type" in x or "object" in x) for x in obj[:5]):
+            return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_block_list(v, depth + 1, max_depth)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_block_list(v, depth + 1, max_depth)
+            if found:
+                return found
+    return None
+
+
 def parse_avoma_notes(notes_response):
     """
     Walk Avoma's /v1/notes/ response and return {category_name: plain_text}.
 
-    UNVERIFIED SHAPE — only tested against Adam's toy demo meeting. Both
-    the header key (tried: category/header/title/name/label/type) and the
-    content key (tried: content/children/value/body/text/notes) are
-    guessed defensively so this degrades gracefully instead of throwing.
-    Diff this function's output against a real call's notes before
-    trusting the mapping in production.
+    CONFIRMED 2026-09-04 against real analyzed calls (via
+    avoma_to_close_dialer_sync.py, same /v1/notes/ endpoint — replaces the
+    earlier "Adam's toy demo meeting" guess). Avoma's /notes/ endpoint
+    returns a paginated envelope ({"count","next","previous","results"});
+    "results" holds one (occasionally more) wrapper record(s), and the
+    actual note content is a FLAT Slate-style block list nested somewhere
+    inside each record (found dynamically via _find_block_list rather
+    than a hardcoded key path, since the exact wrapper key wasn't
+    confirmed and may not be stable). Blocks alternate: a "header-2"-type
+    block whose extracted text is the category name (e.g. "Key
+    Takeaways", "Pain Points", "Action Items", plus many call-specific
+    categories like "Situational Analysis (current vs desired state)"),
+    followed by one or more content blocks (typically "unordered-list")
+    whose extracted text is that category's content, until the next
+    header block.
     """
     if not notes_response:
         return {}
 
-    items = notes_response
+    records = notes_response
     if isinstance(notes_response, dict):
-        items = (
+        records = (
             notes_response.get("results")
             or notes_response.get("data")
             or notes_response.get("notes")
             or []
         )
-        if isinstance(items, dict):
-            items = [{"category": k, "content": v} for k, v in items.items()]
+        if isinstance(records, dict):
+            records = [records]
+    if not isinstance(records, list):
+        return {}
+
+    blocks = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("type") or record.get("object"):
+            blocks.append(record)
+            continue
+        nested = _find_block_list(record)
+        if nested:
+            blocks.extend(b for b in nested if isinstance(b, dict))
 
     out = {}
-    for item in items or []:
-        if not isinstance(item, dict):
+    current_category = None
+    for block in blocks:
+        btype = str(block.get("type") or block.get("object") or "").lower()
+        if btype.startswith("header"):
+            header_text = _slate_node_text(block.get("children")).strip()
+            if header_text:
+                current_category = NOTES_CATEGORY_ALIASES.get(header_text.lower(), header_text)
             continue
-        header = None
-        for key in ("category", "header", "title", "name", "label", "type"):
-            if item.get(key):
-                header = str(item[key]).strip()
-                break
-        if not header:
+        if not current_category:
             continue
-        content = None
-        for key in ("content", "children", "value", "body", "text", "notes"):
-            if key in item:
-                content = item[key]
-                break
-        text = _slate_node_text(content).strip()
-        if not text:
+        lines = _slate_block_to_lines(block.get("children"))
+        if not lines:
             continue
-        canonical = NOTES_CATEGORY_ALIASES.get(header.lower(), header)
-        out[canonical] = (out[canonical] + "\n\n" + text).strip() if canonical in out else text
+        bulleted = "\n".join(f"• {line}" for line in lines)
+        out[current_category] = (
+            (out[current_category] + "\n" + bulleted)
+            if current_category in out
+            else bulleted
+        )
     return out
+
+
+def build_full_call_summary(notes):
+    """Combine every parsed category into one Call Summary block, in the
+    order Avoma's notes document presents them — not just one section."""
+    if not notes:
+        return ""
+    return "\n\n".join(f"{category}\n{content}" for category, content in notes.items())
 
 
 def get_note_value(notes_dict, category_name):
@@ -776,9 +862,19 @@ def process_meeting(meeting, type_info):
     evaluations = avoma_get_scorecard_evaluations(uuid)
     notes_raw = avoma_get_notes(uuid)
     notes = parse_avoma_notes(notes_raw)
+    log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
     if not evaluations and not notes:
-        log("→ Avoma analysis not yet complete (no scorecard evaluations, no notes), skip", indent=1)
-        return ("skipped", "not-analyzed")
+        if not ALLOW_INCOMPLETE_ANALYSIS:
+            log("→ Avoma analysis not yet complete (no scorecard evaluations, no notes), skip", indent=1)
+            return ("skipped", "not-analyzed")
+        log(
+            "→ Avoma analysis not yet complete, but ALLOW_INCOMPLETE_ANALYSIS=1 — "
+            "proceeding with only the fields available now (round-trip test mode). "
+            "NOTE: this Custom Activity will NOT be auto-enriched later once real "
+            "analysis exists — the idempotency check will see it already exists "
+            "and skip creating an updated one. Test-only, not for the scheduled cron.",
+            indent=1,
+        )
     if not notes:
         log("Note: no parsed notes (likely setter-style scorecard or unrecognized notes shape); proceeding with scorecard-only fields", indent=1)
 
@@ -816,7 +912,10 @@ def process_meeting(meeting, type_info):
     # 5. Pull analysis fields
     qa_score = extract_qa_score(evaluations)
     doubt_text = get_note_value(notes, DOUBT_ANALOG_CATEGORY)
-    call_summary = get_note_value(notes, CALL_SUMMARY_ANALOG_CATEGORY)
+    # Call Summary = every parsed category concatenated, not just one
+    # section — see build_full_call_summary().
+    call_summary = build_full_call_summary(notes)
+    log(f"Call summary length: {len(call_summary)} chars across {len(notes)} categories", indent=1)
 
     # 6. Haiku enrichment
     log("Classifying Primary Objection (Haiku)...", indent=1)
@@ -911,7 +1010,10 @@ def process_meeting(meeting, type_info):
 
 # ===== Main =====
 def main():
-    section(f"Avoma → Close meeting analysis sync (HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN})")
+    section(
+        f"Avoma → Close meeting analysis sync (HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN}, "
+        f"ALLOW_INCOMPLETE_ANALYSIS={ALLOW_INCOMPLETE_ANALYSIS})"
+    )
 
     section("Resolving Close Custom Activity Type")
     type_info = find_custom_activity_type()
