@@ -597,11 +597,32 @@ def enrich_call(close_call, type_info):
     notes = parse_avoma_notes(notes_raw)
     log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
     if notes_raw:
-        # DEBUG (assumption #3 unverified) — dump the raw /notes/ shape so we
-        # can see why expected categories (Pain Points / Key Takeaways) are
-        # or aren't coming through. Remove once mapping is confirmed.
-        log("DEBUG: raw /notes/ response (up to 3000 chars):", indent=1)
-        log(json.dumps(notes_raw, indent=2)[:3000], indent=2)
+        # DEBUG (assumption #3 unverified) — the raw JSON dump was too big
+        # and got truncated in the log. Instead, print a compact type+text
+        # sequence for every block so we can see where headings (category
+        # names) live in the structure vs. content blocks like "transcript".
+        debug_items = notes_raw
+        if isinstance(notes_raw, dict):
+            debug_items = (
+                notes_raw.get("results")
+                or notes_raw.get("data")
+                or notes_raw.get("notes")
+                or []
+            )
+            if isinstance(debug_items, dict):
+                debug_items = [{"type": k, "children": v} for k, v in debug_items.items()]
+        log(f"DEBUG: /notes/ top-level type: {type(notes_raw).__name__}"
+            + (f", dict keys: {list(notes_raw.keys())}" if isinstance(notes_raw, dict) else ""), indent=1)
+        log(f"DEBUG: {len(debug_items) if isinstance(debug_items, list) else '?'} block(s) — type + text preview:", indent=1)
+        if isinstance(debug_items, list):
+            for i, item in enumerate(debug_items[:150]):
+                if not isinstance(item, dict):
+                    log(f"  [{i}] (non-dict item: {type(item).__name__})", indent=2)
+                    continue
+                itype = item.get("type") or item.get("object") or "?"
+                data_keys = list(item.get("data", {}).keys()) if isinstance(item.get("data"), dict) else None
+                text_preview = _slate_node_text(item.get("children")).strip().replace("\n", " ")[:70]
+                log(f"  [{i}] type={itype!r} data_keys={data_keys} text={text_preview!r}", indent=2)
     analysis_incomplete = not evaluations and not notes
     if analysis_incomplete:
         if not ALLOW_INCOMPLETE_ANALYSIS:
