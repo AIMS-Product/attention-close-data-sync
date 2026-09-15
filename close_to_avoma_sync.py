@@ -443,10 +443,41 @@ def avoma_extract_meeting_uuid(call_response):
     return None
 
 
+class AvomaAccountLimitation(Exception):
+    """
+    Raised when Avoma rejects a call import for an account/licensing reason
+    on the REP'S side — not a data problem or a code bug. First seen
+    2026-09-15: Joe Dysert's Avoma seat didn't have the dialer feature
+    enabled ("User (joedysert@modern-amenities.com) does not have dialer
+    feature and cannot log calls."), same class of issue as Adam's earlier
+    seat-downgrade 403. The rest of the batch is unaffected either way —
+    each call is already processed in its own try/except in main() — but
+    without this, a per-user licensing gap counted as a hard "failed" and
+    flipped the whole GitHub Actions run red even though every other call
+    imported fine. Now it's tracked as a skip with its own reason so the
+    run stays green until the seat gets fixed in Avoma.
+    """
+    pass
+
+
+# Substrings (case-insensitive) in a failed Avoma /v1/calls/ response body
+# that indicate an account/seat/feature limitation on the rep's Avoma user,
+# not a real data or code problem. Expand as new variants show up.
+SKIPPABLE_AVOMA_IMPORT_MARKERS = (
+    "does not have dialer feature",
+    "cannot log calls",
+)
+
+
 def avoma_import_call(payload):
     resp = avoma_post("/calls/", payload)
     if not resp.ok:
-        raise Exception(f"Avoma import failed: {resp.status_code}: {resp.text[:500]}")
+        body = resp.text[:500]
+        if any(marker in body.lower() for marker in SKIPPABLE_AVOMA_IMPORT_MARKERS):
+            raise AvomaAccountLimitation(
+                f"{payload.get('user_email', '?')}: {body}"
+            )
+        raise Exception(f"Avoma import failed: {resp.status_code}: {body}")
     return resp.json()
 
 
@@ -693,6 +724,7 @@ def main():
     section("Importing calls")
     user_info_cache = {}  # Close user_id → (email, name)
     stats = {"imported": 0, "skipped": 0, "failed": 0}
+    skip_reasons = {}
 
     for call in calls:
         try:
@@ -701,6 +733,16 @@ def main():
                 stats["imported"] += 1
             else:
                 stats["skipped"] += 1
+        except AvomaAccountLimitation as e:
+            # Known account/seat/feature gap on the rep's Avoma user — not a
+            # data problem or a code bug (see class docstring). Counts as a
+            # skip, not a failure, so one rep's un-provisioned seat doesn't
+            # flip the whole run red. Grouped by rep email so it's obvious
+            # at a glance whose seat needs attention in Avoma.
+            stats["skipped"] += 1
+            reason = f"avoma-account-limitation ({e})"
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            log(f"⚠️  Skipping {call.get('id')} — Avoma account limitation: {e}", indent=1)
         except Exception as e:
             stats["failed"] += 1
             log(f"❌ Error importing {call.get('id')}: {e}", indent=1)
@@ -708,6 +750,8 @@ def main():
     section("Done")
     log(f"Imported: {stats['imported']}")
     log(f"Skipped:  {stats['skipped']}")
+    for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
+        log(f"  ({reason}: {count})", indent=1)
     log(f"Failed:   {stats['failed']}")
 
     sys.exit(0 if stats["failed"] == 0 else 1)
