@@ -74,14 +74,28 @@ docs for the full write-up):
    Tezen / Luke Herman) whose title lacked the "vendingpren" first-sale
    marker, so it landed here, in avoma_to_close_meeting_sync.py, which
    had nowhere to put that signal. update_lead_qualified() now runs
-   unconditionally (any meeting_type, not just Follow-up), mirrors the
-   override-respecting pattern from update_lead_show_and_qualified() in
-   avoma_to_close_first_meeting_sync.py, and never touches
-   FIRST_CALL_SHOW_FIELD / FIRST_CALL_SHOW_OVERRIDE_FIELD — those stay
-   exclusive to the first-meeting sync. Separately, classify_meeting_type()
-   now accepts an optional Avoma `purpose.label` fallback, used ONLY when
-   title-keyword matching alone would return "Other" — title stays the
-   primary signal per explicit instruction.
+   unconditionally (any meeting_type, not just Follow-up), and never
+   touches FIRST_CALL_SHOW_FIELD / FIRST_CALL_SHOW_OVERRIDE_FIELD — those
+   stay exclusive to the first-meeting sync. Separately,
+   classify_meeting_type() now accepts an optional Avoma `purpose.label`
+   fallback, used ONLY when title-keyword matching alone would return
+   "Other" — title stays the primary signal per explicit instruction.
+
+   OVERWRITE RULE (refined 2026-09-16, same day, by explicit follow-up
+   request): unlike update_lead_show_and_qualified() in the sibling
+   first-meeting script — which still treats ANY existing Qualified value
+   as final — this script's update_lead_qualified() treats Qualified
+   Override = "Yes" as the ONLY thing that locks the field. A value that
+   is merely present (set by an earlier call's automation, not
+   override-flagged) is fair game and gets overwritten by a later call's
+   derived value. This lets a later, clearer call correct an earlier
+   ambiguous/wrong one. Practical implication for reps: manually
+   correcting Qualified by hand should be paired with setting Qualified
+   Override to Yes, or a subsequent call's sync will silently overwrite
+   the correction. (The sibling first-meeting script was deliberately
+   left as-is — it only ever fires once per lead on the first call, so
+   the "overwrite" question mostly doesn't arise there; flag to Stephen
+   if he wants matching behavior there too.)
 ============================================================================
 
 Required GitHub secrets:
@@ -757,10 +771,23 @@ def update_lead_qualified(lead_id, outcome_label):
     follow-up call (Marty Tezen / Luke Herman, 2026-09-16) whose title
     didn't carry the "vendingpren" marker, so it never reached
     avoma_to_close_first_meeting_sync.py — there was nowhere for that
-    signal to go. Mirrors update_lead_show_and_qualified()'s
-    override-respecting pattern in the sibling script, minus the
-    First Call Show Up half (not this script's concern). Called
-    unconditionally — Qualified can come from Discovery, Setter,
+    signal to go.
+
+    UPDATED 2026-09-16 (again), by explicit request: follow-up calls are
+    now allowed to OVERWRITE a Qualified value that a previous call's
+    automation set — the old "any existing value blocks a write" guard
+    treated every existing value as final, which meant an early
+    ambiguous/wrong read could never be corrected by a clearer signal on
+    a later call. The ONLY thing that now blocks a write is Qualified
+    Override = "Yes" — that field is the explicit "a human decided this,
+    hands off" signal. A value that's merely present but not
+    override-flagged is treated as automation's own prior guess and is
+    fair game to update. Practical implication: if a rep manually
+    corrects Qualified by hand, they should also flip Qualified Override
+    to Yes, or a later call's sync will silently overwrite their
+    correction again.
+
+    Called unconditionally — Qualified can come from Discovery, Setter,
     Next Steps, or Other meeting types, not just Follow-up.
     """
     qualified_value = derive_qualified_value(outcome_label)
@@ -771,23 +798,23 @@ def update_lead_qualified(lead_id, outcome_label):
     if (overrides["qualified_override"] or "").lower() == "yes":
         log("Qualified Override is 'Yes' — leaving field untouched", indent=1)
         return {}
-    if overrides["qualified_current"]:
-        log(
-            f"Qualified already set to {overrides['qualified_current']!r} — leaving field untouched (rep judgment wins)",
-            indent=1,
-        )
+
+    previous = overrides["qualified_current"]
+    if previous == qualified_value:
+        log(f"Qualified already set to {qualified_value!r}; no change needed", indent=1)
         return {}
 
     payload = {f"custom.{QUALIFIED_FIELD}": qualified_value}
 
     if DRY_RUN:
-        log(f"DRY_RUN — would PUT lead {lead_id} with: {payload}", indent=1)
+        log(f"DRY_RUN — would PUT lead {lead_id} with: {payload} (previous value: {previous!r})", indent=1)
         return {"Qualified": qualified_value}
 
     resp = close_put(f"/lead/{lead_id}/", payload)
     if not resp.ok:
         log(f"⚠️  Failed to update Qualified on lead {lead_id}: {resp.status_code}: {resp.text[:300]}", indent=1)
         return {}
+    log(f"Qualified: {previous!r} → {qualified_value!r}", indent=1)
     return {"Qualified": qualified_value}
 
 
