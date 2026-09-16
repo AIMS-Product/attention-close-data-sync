@@ -567,12 +567,30 @@ def derive_show_value(meeting, segments, outcome_label=None):
     return None
 
 
+def extract_outcome_label(meeting):
+    """
+    CONFIRMED 2026-09-16 against a real tagged call: Avoma's `outcome`
+    field is an OBJECT, not a plain string — {"label": "Disqualified",
+    "uuid": "..."} — unlike Attention's labels.Outcome, which was a bare
+    string. An untagged meeting returns outcome: None. This normalizes
+    both shapes to a plain string so the substring-matching logic below
+    (and in derive_show_value / is_lost_outcome) doesn't need to know or
+    care which shape it got. Always call this instead of reading
+    meeting.get("outcome") directly.
+    """
+    outcome = meeting.get("outcome")
+    if isinstance(outcome, dict):
+        return outcome.get("label") or ""
+    if isinstance(outcome, str):
+        return outcome
+    return ""
+
+
 def derive_qualified_value(outcome_label):
     """
-    Maps Avoma's native `outcome` field to 'Yes'/'No' for the Qualified
-    field. UNVERIFIED (assumption #5) — outcome is null on every real
-    meeting pulled so far, so this will not fire until reps/setters start
-    tagging outcomes in Avoma (via "Set meeting outcome" or the UI).
+    Maps Avoma's native `outcome` field (see extract_outcome_label()) to
+    'Yes'/'No' for the Qualified field. CONFIRMED WORKING 2026-09-16
+    against a real "Disqualified" tagged call.
     """
     if not outcome_label:
         return None
@@ -882,7 +900,7 @@ def process_meeting(meeting, type_info):
     key_concern = haiku_summarize_concern(doubt_text)
     log(f"→ {key_concern[:120]}", indent=2)
 
-    outcome_label = meeting.get("outcome") or ""
+    outcome_label = extract_outcome_label(meeting)
     log(f"Outcome: {outcome_label!r}", indent=1)
     lost_reason = ""
     if is_lost_outcome(outcome_label):
