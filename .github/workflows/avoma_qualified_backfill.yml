@@ -1,0 +1,52 @@
+name: ONE-OFF — Qualified Field Backfill (Sept 2026)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'DRY_RUN — "1" logs only, "0" actually writes to Close'
+        required: false
+        default: '1'
+      backfill_since:
+        description: 'Window start (ISO8601 UTC)'
+        required: false
+        default: '2026-09-01T00:00:00Z'
+      backfill_until:
+        description: 'Window end (ISO8601 UTC) — leave blank for "now"'
+        required: false
+        default: ''
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Qualified backfill
+        env:
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          BACKFILL_SINCE: ${{ inputs.backfill_since }}
+          BACKFILL_UNTIL: ${{ inputs.backfill_until }}
+        run: python3 -u avoma_qualified_backfill.py
+
+      - name: Upload audit CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualified-backfill-audit
+          path: qualified_backfill_audit_*.csv
+          retention-days: 90
