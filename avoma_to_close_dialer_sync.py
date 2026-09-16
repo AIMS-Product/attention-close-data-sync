@@ -516,6 +516,23 @@ Respond with ONLY the summary, no preamble."""
     return resp.json()["content"][0]["text"].strip()
 
 
+def extract_outcome_label(meeting):
+    """
+    CONFIRMED 2026-09-16 against a real tagged call: Avoma's `outcome`
+    field is an OBJECT, not a plain string — {"label": "Disqualified",
+    "uuid": "..."} — unlike Attention's labels.Outcome, which was a bare
+    string. An untagged meeting returns outcome: None. Normalizes both
+    shapes to a plain string. Always call this instead of reading
+    meeting.get("outcome") directly.
+    """
+    outcome = meeting.get("outcome")
+    if isinstance(outcome, dict):
+        return outcome.get("label") or ""
+    if isinstance(outcome, str):
+        return outcome
+    return ""
+
+
 def is_lost_outcome(outcome_label):
     if not outcome_label:
         return False
@@ -760,7 +777,7 @@ def enrich_call(close_call, type_info):
     key_concern = haiku_summarize_concern(doubt_text)
     log(f"→ {key_concern[:120]}", indent=2)
 
-    outcome_label = meeting.get("outcome") or ""
+    outcome_label = extract_outcome_label(meeting)
     log(f"Outcome: {outcome_label!r}", indent=1)
     lost_reason = ""
     if is_lost_outcome(outcome_label):
