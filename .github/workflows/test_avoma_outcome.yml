@@ -1,0 +1,32 @@
+name: TEST — Avoma Outcome Diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      meeting_uuid:
+        description: 'Avoma meeting UUID to inspect'
+        required: false
+        default: 'b8780aef-0a08-4bea-b006-0e0670a030c0'
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch and inspect meeting outcome
+        env:
+          AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
+          MEETING_UUID: ${{ inputs.meeting_uuid }}
+        run: python3 -u test_avoma_outcome.py
