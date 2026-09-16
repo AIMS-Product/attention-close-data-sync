@@ -31,11 +31,19 @@ plan.md in the project docs):
    when a call has no discovery objections, which is expected.
 3. QA SCORE SHAPE — extract_qa_score()'s field-name guesses are unverified;
    no live scorecard has scored a real call yet.
-4. ATTENDANCE / SHOW-UP — derive_show_value() is a duration + speaker-
-   talk-time heuristic, not a confirmed Avoma field.
+4. ATTENDANCE / SHOW-UP — UPDATED 2026-09-16. derive_show_value() now
+   checks Avoma's native `outcome` field first (same field as Qualified),
+   since "No-Show" is one of Avoma's real, admin-configured Outcome values
+   (confirmed in Settings > Purposes and Outcomes, alongside Qualified/
+   Disqualified) with its own AI-detection description. Only falls back
+   to the old duration + speaker-talk-time heuristic when outcome_label
+   hasn't been tagged yet.
 5. QUALIFIED DERIVATION — derive_qualified_value() reads Avoma's native
-   `outcome` field, which was confirmed NULL on every real meeting so far.
-   Will not populate anything until reps/setters tag outcomes in Avoma.
+   `outcome` field. Was NULL on every real meeting through 2026-09-15;
+   Stephen has since configured Qualified/Disqualified/No-Show Outcomes
+   in Avoma with AI-detection descriptions (Settings > Purposes and
+   Outcomes > Automations), so this should start populating once Avoma
+   tags real meetings — not yet verified against a live tagged call.
 6. AVOMA WEB LINK FORMAT — assumed https://app.avoma.com/meetings/{uuid}.
 ============================================================================
 
@@ -515,8 +523,26 @@ def extract_prospect_name_from_title(title):
     return None
 
 
-def derive_show_value(meeting, segments):
-    """BEST-EFFORT / UNVERIFIED (see assumption #4)."""
+def derive_show_value(meeting, segments, outcome_label=None):
+    """
+    UPDATED 2026-09-16 — Avoma's "No-Show" is a real, purpose-built Outcome
+    value (same field/mechanism as Qualified/Disqualified — see
+    derive_qualified_value()), configured with an AI-detection description
+    in Settings > Purposes and Outcomes. That's a far more reliable signal
+    than the old speaker-diarization/duration guess, so it's checked first.
+    The heuristic below is now only a fallback for meetings where no
+    Outcome has been tagged yet (e.g. analysis still in progress).
+    """
+    if outcome_label:
+        lower = outcome_label.lower()
+        if "no-show" in lower or "no show" in lower or "ghost" in lower:
+            return "No"
+        # Any other real (non-empty) outcome means the meeting happened
+        # with enough substance for a rep/AI to classify it at all.
+        return "Yes"
+
+    # BEST-EFFORT / UNVERIFIED fallback (see assumption #4) — used only
+    # while outcome_label hasn't been tagged yet.
     speaker_segments = (segments or {}).get("speaker_segments") if segments else None
     if isinstance(speaker_segments, dict) and speaker_segments:
         attendees = meeting.get("attendees") or meeting.get("participants") or []
@@ -581,7 +607,7 @@ def get_lead_overrides(lead_id):
 
 
 def update_lead_show_and_qualified(lead_id, meeting, segments, outcome_label):
-    show_value = derive_show_value(meeting, segments)
+    show_value = derive_show_value(meeting, segments, outcome_label)
     qualified_value = derive_qualified_value(outcome_label)
 
     if show_value is None and qualified_value is None:
