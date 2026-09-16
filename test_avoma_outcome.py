@@ -23,6 +23,7 @@ Safe to run any time — read-only, makes no writes to Avoma or Close.
 import os
 import sys
 import json
+import time
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -41,9 +42,21 @@ def log(msg, indent=0):
 
 
 def avoma_get(url, params=None):
+    """Retry on 429/502/503/504, same pattern as the production sync scripts."""
     full_url = url if url.startswith("http") else f"{AVOMA_API_BASE}{url}"
-    resp = requests.get(full_url, headers=AVOMA_HEADERS, params=params, timeout=60)
-    return resp
+    for attempt in range(6):
+        resp = requests.get(full_url, headers=AVOMA_HEADERS, params=params, timeout=60)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", "5"))
+            log(f"[Avoma] 429 rate limited, waiting {wait}s...", indent=1)
+            time.sleep(wait)
+            continue
+        if resp.status_code in (502, 503, 504):
+            time.sleep(2 ** attempt)
+            continue
+        time.sleep(0.3)  # small buffer between calls, matches production delay
+        return resp
+    raise Exception(f"Avoma GET {url} exhausted retries")
 
 
 def fetch_meeting_by_uuid(uuid):
