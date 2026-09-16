@@ -105,6 +105,20 @@ def fetch_meeting_by_uuid(uuid):
     return None
 
 
+def extract_outcome_label(meeting):
+    """
+    CONFIRMED 2026-09-16: Avoma's `outcome` field is an OBJECT, not a
+    plain string — {"label": "Disqualified", "uuid": "..."}. Untagged
+    meetings return outcome: None. Normalizes both to a plain string.
+    """
+    outcome = meeting.get("outcome")
+    if isinstance(outcome, dict):
+        return outcome.get("label") or ""
+    if isinstance(outcome, str):
+        return outcome
+    return ""
+
+
 def derive_qualified_value(outcome_label):
     """Copied verbatim from avoma_to_close_first_meeting_sync.py — keep in sync."""
     if not outcome_label:
@@ -145,12 +159,14 @@ def main():
     for key in ("uuid", "subject", "outcome", "purpose", "duration", "start_at", "end_at", "is_call"):
         log(f"  {key}: {meeting.get(key)!r}", indent=1)
 
-    outcome_label = meeting.get("outcome") or ""
-    log(f"\nRaw outcome value as returned by Avoma: {outcome_label!r}")
+    raw_outcome = meeting.get("outcome")
+    outcome_label = extract_outcome_label(meeting)
+    log(f"\nRaw outcome field as returned by Avoma: {raw_outcome!r}")
+    log(f"Extracted label: {outcome_label!r}")
 
     if not outcome_label:
         log("⚠️  outcome is empty/null — nothing was tagged on this meeting, or")
-        log("   the field name/shape is different than assumed. Full meeting")
+        log("   the field shape is different than assumed. Full meeting")
         log("   JSON dumped below for inspection.")
     else:
         qualified_value = derive_qualified_value(outcome_label)
