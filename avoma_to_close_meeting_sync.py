@@ -47,16 +47,20 @@ docs for the full write-up):
    only been observed as an empty result set — no live scorecard has
    scored a real call yet. The field-name guesses here are UNVERIFIED.
 
-4. ATTENDANCE / SHOW-UP (derive_show_value below): Attention had a
-   labels.Attendance classification with no confirmed Avoma analog. This
-   uses a duration + speaker-talk-time heuristic via the confirmed
-   /v1/meeting_segments/ endpoint. Needs validation against real calls.
+4. ATTENDANCE / SHOW-UP (derive_show_value below): UPDATED 2026-09-16.
+   "No-Show" is a real, admin-configured Avoma Outcome value (confirmed in
+   Settings > Purposes and Outcomes, alongside Qualified/Disqualified),
+   set up with an AI-detection description. derive_show_value() now checks
+   outcome_label first and only falls back to the old duration +
+   speaker-talk-time heuristic (via /v1/meeting_segments/) when no outcome
+   has been tagged yet.
 
-5. OUTCOME / LOST DETECTION: Avoma meetings have a native `outcome` field,
-   but it was confirmed NULL on every real meeting pulled so far (nothing
-   is tagging calls yet). This sync still checks it defensively, but in
-   practice Lost Reason will not populate until reps/setters start using
-   Avoma's outcome tagging.
+5. OUTCOME / LOST DETECTION: Avoma meetings have a native `outcome` field.
+   Was NULL on every real meeting through 2026-09-15; Stephen has since
+   configured Qualified/Disqualified/No-Show Outcomes with AI-detection
+   descriptions (Settings > Purposes and Outcomes > Automations), so
+   Lost Reason and the Follow Up Call Show slots below should start
+   populating once Avoma tags real meetings — not yet verified live.
 
 6. AVOMA WEB LINK FORMAT (avoma_link below): assumed
    https://app.avoma.com/meetings/{uuid} — not independently confirmed,
@@ -691,11 +695,14 @@ def extract_prospect_name_from_title(title):
     return None
 
 
-def derive_show_value(meeting, segments):
+def derive_show_value(meeting, segments, outcome_label=None):
     """
-    BEST-EFFORT / UNVERIFIED (see assumption #4 in module docstring).
-    Avoma has no confirmed direct analog to Attention's
-    labels.Attendance ("Shown"/"No-show"/"Late"/"Ghost"). Heuristic:
+    UPDATED 2026-09-16 — Avoma's "No-Show" is a real, admin-configured
+    Outcome value (same field/mechanism as Qualified/Disqualified — see
+    derive_qualified_value()), set up with an AI-detection description in
+    Settings > Purposes and Outcomes. Checked first, since it's a far more
+    reliable signal than guessing from speaker talk-time. Falls back to
+    the old heuristic only when outcome_label hasn't been tagged yet:
       1. If meeting_segments' `speaker_segments` map shows ANY talk-time
          for a non-internal speaker → "Yes".
       2. If segments are available but show only internal speakers
@@ -705,6 +712,12 @@ def derive_show_value(meeting, segments):
       4. Otherwise → None (unknown; caller leaves the field untouched,
          same safe default as the Attention build).
     """
+    if outcome_label:
+        lower = outcome_label.lower()
+        if "no-show" in lower or "no show" in lower or "ghost" in lower:
+            return "No"
+        return "Yes"
+
     speaker_segments = (segments or {}).get("speaker_segments") if segments else None
     if isinstance(speaker_segments, dict) and speaker_segments:
         attendees = meeting.get("attendees") or meeting.get("participants") or []
@@ -968,7 +981,7 @@ def process_meeting(meeting, type_info):
         log(json.dumps(payload, indent=2)[:1500], indent=2)
         if meeting_type == "Follow-up":
             segments = avoma_get_meeting_segments(uuid)
-            show_value = derive_show_value(meeting, segments)
+            show_value = derive_show_value(meeting, segments, outcome_label)
             if show_value is None:
                 log("Attendance unclear; would skip Follow Up Call Show update", indent=1)
             else:
@@ -992,7 +1005,7 @@ def process_meeting(meeting, type_info):
 
     if meeting_type == "Follow-up":
         segments = avoma_get_meeting_segments(uuid)
-        show_value = derive_show_value(meeting, segments)
+        show_value = derive_show_value(meeting, segments, outcome_label)
         if show_value is None:
             log("Attendance unclear; skipping Follow Up Call Show update", indent=1)
         else:
