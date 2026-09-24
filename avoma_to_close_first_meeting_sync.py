@@ -4,8 +4,25 @@ Avoma → Close first-meeting analysis sync (Custom Activity edition).
 
 Avoma rebuild of attention_to_close_first_meeting_sync.py. Captures first
 sales calls and writes them to a Custom Activity, plus updates the lead-
-level First Call Show Up / Qualified fields (honoring their override
-fields, same as the Attention build).
+level Qualified field (honoring its override field).
+
+UPDATED 2026-09-24 — MEETING OUTCOME IS NOW THE SOURCE OF TRUTH:
+  * NEW: write_meeting_outcome() maps Avoma's native Outcome tag
+    (Show / No-Show / Rescheduled / Qualified / Disqualified / ...) onto
+    the Close MEETING's native Meeting Outcome (outcome_id):
+        No-Show-ish            -> No Show
+        Rescheduled-ish        -> Rescheduled
+        Canceled-ish           -> Cancelled
+        any other real tag     -> Completed  (a tagged conversation happened)
+    Runs on every pass — including when the Custom Activity already
+    exists — because Avoma's tag can land hours after analysis. Never
+    overwrites an existing terminal outcome (human edits win).
+  * REMOVED: the direct First Call Show Up field write and the
+    duration/speaker-diarization show heuristic (derive_show_value /
+    meeting_segments). outcome_sync.py's field projection now maintains
+    First Call Show Up FROM the Meeting Outcome — single writer, and the
+    First Call Show (Override) field remains untouched by automation.
+    Qualified handling is unchanged.
 
 Filter (must satisfy ALL):
   - Subject contains "vendingpren" (the first-sale marker)
@@ -31,20 +48,17 @@ plan.md in the project docs):
    when a call has no discovery objections, which is expected.
 3. QA SCORE SHAPE — extract_qa_score()'s field-name guesses are unverified;
    no live scorecard has scored a real call yet.
-4. ATTENDANCE / SHOW-UP — UPDATED 2026-09-16. derive_show_value() now
-   checks Avoma's native `outcome` field first (same field as Qualified),
-   since "No-Show" is one of Avoma's real, admin-configured Outcome values
-   (confirmed in Settings > Purposes and Outcomes, alongside Qualified/
-   Disqualified) with its own AI-detection description. Only falls back
-   to the old duration + speaker-talk-time heuristic when outcome_label
-   hasn't been tagged yet.
+4. ATTENDANCE / SHOW-UP — REARCHITECTED 2026-09-24 (see UPDATED note at
+   top). Avoma's Outcome tag now writes the Close Meeting Outcome
+   directly; the lead field follows via outcome_sync.py's projection.
 5. QUALIFIED DERIVATION — derive_qualified_value() reads Avoma's native
-   `outcome` field. Was NULL on every real meeting through 2026-09-15;
-   Stephen has since configured Qualified/Disqualified/No-Show Outcomes
-   in Avoma with AI-detection descriptions (Settings > Purposes and
-   Outcomes > Automations), so this should start populating once Avoma
-   tags real meetings — not yet verified against a live tagged call.
+   `outcome` field. CONFIRMED WORKING 2026-09-16 against a real
+   "Disqualified" tagged call.
 6. AVOMA WEB LINK FORMAT — assumed https://app.avoma.com/meetings/{uuid}.
+7. AVOMA MEETING START FIELD — avoma_meeting_start() tries several key
+   names; the first real meeting processed logs which one matched. If
+   none parse, the outcome write is skipped with a log line (we never
+   guess which Close meeting to stamp).
 ============================================================================
 
 Required GitHub secrets:
@@ -64,6 +78,8 @@ Optional env vars:
                                 this way will NOT be auto-enriched later —
                                 the idempotency check sees it already
                                 exists once real analysis lands and skips.
+                                (The Meeting Outcome write is NOT affected:
+                                it re-runs on every pass regardless.)
 """
 
 import os
@@ -120,10 +136,19 @@ FIRST_SALE_TITLE_MARKER = "vendingpren"
 OBJECTION_CHOICES = ("Timing", "Investment", "Fit", "Other")
 LOSS_OUTCOME_MARKERS = ("disqualified", "lost", "not interested", "closed lost")
 
-# Lead-level field IDs — unchanged from the Attention build (Close side,
-# untouched by the vendor swap).
-FIRST_CALL_SHOW_FIELD = "cf_OPyvpU45RdvjLqfm8V1VWwNxrGKogEH2IBJmfCj0Uhq"
-FIRST_CALL_SHOW_OVERRIDE_FIELD = "cf_CJMktLJShTyA86PdBqNUP59ZfJh0WpdB1tEt76Y3HEy"
+# ---- Close native Meeting Outcome ids (SYNC WITH outcome_sync.py) ----
+OUTCOMES = {
+    "scheduled":   "outcome_032DjlzDKpdXJZOzK4f7q3",
+    "completed":   "outcome_032Djn4dfeNuEoCunojA7K",
+    "rescheduled": "outcome_032Djo72GJ2Lvw3Q296wxH",
+    "no_show":     "outcome_032DjoyPo9BgPBdOF6DzqH",
+    "cancelled":   "outcome_032DjpoQ9otqb8rGb7SIYt",
+}
+MEETING_MATCH_HOURS = 4  # Close meeting must start within this of the Avoma meeting
+
+# Lead-level field IDs — Qualified only. (First Call Show Up is now
+# maintained by outcome_sync.py's projection FROM the Meeting Outcome;
+# this script must not also write it — two writers would fight.)
 QUALIFIED_FIELD = "cf_ZDx7NBQaDzV1yYrFcBMzt6cIYj81dAcswpNN0CQzCPS"
 QUALIFIED_OVERRIDE_FIELD = "cf_nizevVbDT00CqdjfqQY9NSiBvCtuRl1mT1VxQie6zpc"
 
@@ -296,13 +321,6 @@ def avoma_get_scorecard_evaluations(meeting_uuid):
 
 def avoma_get_notes(meeting_uuid):
     resp = avoma_get("/notes/", params={"meeting_uuid": meeting_uuid})
-    if not resp.ok:
-        return None
-    return resp.json()
-
-
-def avoma_get_meeting_segments(meeting_uuid):
-    resp = avoma_get("/meeting_segments/", params={"uuid": meeting_uuid})
     if not resp.ok:
         return None
     return resp.json()
@@ -523,50 +541,6 @@ def extract_prospect_name_from_title(title):
     return None
 
 
-def derive_show_value(meeting, segments, outcome_label=None):
-    """
-    UPDATED 2026-09-16 — Avoma's "No-Show" is a real, purpose-built Outcome
-    value (same field/mechanism as Qualified/Disqualified — see
-    derive_qualified_value()), configured with an AI-detection description
-    in Settings > Purposes and Outcomes. That's a far more reliable signal
-    than the old speaker-diarization/duration guess, so it's checked first.
-    The heuristic below is now only a fallback for meetings where no
-    Outcome has been tagged yet (e.g. analysis still in progress).
-    """
-    if outcome_label:
-        lower = outcome_label.lower()
-        if "no-show" in lower or "no show" in lower or "ghost" in lower:
-            return "No"
-        # Any other real (non-empty) outcome means the meeting happened
-        # with enough substance for a rep/AI to classify it at all.
-        return "Yes"
-
-    # BEST-EFFORT / UNVERIFIED fallback (see assumption #4) — used only
-    # while outcome_label hasn't been tagged yet.
-    speaker_segments = (segments or {}).get("speaker_segments") if segments else None
-    if isinstance(speaker_segments, dict) and speaker_segments:
-        attendees = meeting.get("attendees") or meeting.get("participants") or []
-        internal_emails = {
-            (p.get("email") or "").lower()
-            for p in attendees
-            if isinstance(p, dict) and (p.get("is_rep") or INTERNAL_DOMAIN in (p.get("email") or "").lower())
-        }
-        for speaker_key, ranges in speaker_segments.items():
-            if not ranges:
-                continue
-            if str(speaker_key).lower() in internal_emails:
-                continue
-            return "Yes"
-        return "No"
-
-    duration = meeting.get("duration") or 0
-    if duration > 60:
-        return "Yes"
-    if duration == 0:
-        return "No"
-    return None
-
-
 def extract_outcome_label(meeting):
     """
     CONFIRMED 2026-09-16 against a real tagged call: Avoma's `outcome`
@@ -574,8 +548,8 @@ def extract_outcome_label(meeting):
     "uuid": "..."} — unlike Attention's labels.Outcome, which was a bare
     string. An untagged meeting returns outcome: None. This normalizes
     both shapes to a plain string so the substring-matching logic below
-    (and in derive_show_value / is_lost_outcome) doesn't need to know or
-    care which shape it got. Always call this instead of reading
+    (and in derive_meeting_outcome / is_lost_outcome) doesn't need to
+    know or care which shape it got. Always call this instead of reading
     meeting.get("outcome") directly.
     """
     outcome = meeting.get("outcome")
@@ -584,6 +558,29 @@ def extract_outcome_label(meeting):
     if isinstance(outcome, str):
         return outcome
     return ""
+
+
+def derive_meeting_outcome(outcome_label):
+    """
+    Avoma Outcome tag -> Close Meeting Outcome key (or None = don't write).
+
+    Negative/branch tags first; then ANY other real (non-empty) tag means
+    the meeting happened with enough substance for the AI/rep to classify
+    it at all -> Completed. This mirrors the Show/No-Show definitions
+    configured in Avoma (Settings > Purposes and Outcomes): "Show",
+    "Qualified", "Disqualified", "One Call Close", even "Not Interested"
+    all imply a real two-way conversation took place.
+    """
+    if not outcome_label:
+        return None
+    lower = outcome_label.lower()
+    if "no-show" in lower or "no show" in lower or "ghost" in lower:
+        return "no_show"
+    if "reschedul" in lower:
+        return "rescheduled"
+    if "cancel" in lower:
+        return "cancelled"
+    return "completed"
 
 
 def derive_qualified_value(outcome_label):
@@ -606,55 +603,137 @@ def derive_qualified_value(outcome_label):
     return None
 
 
+# ===== Close Meeting Outcome write (NEW 2026-09-24) =====
+AVOMA_START_KEYS = ("start_at", "started_at", "start_time",
+                    "scheduled_start_at", "meeting_start_time")
+_logged_start_key = [False]
+
+
+def avoma_meeting_start(meeting):
+    """Parse the Avoma meeting's start datetime, trying known key names
+    (assumption #7). Logs which key matched, once, so the winner gets
+    confirmed against real data on the first run."""
+    for key in AVOMA_START_KEYS:
+        raw = meeting.get(key)
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if not _logged_start_key[0]:
+                log(f"[start-key] Avoma meeting start parsed from '{key}'", indent=1)
+                _logged_start_key[0] = True
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def find_close_meeting_activity(lead_id, avoma_start):
+    """The Close meeting activity on this lead nearest the Avoma meeting's
+    start, within MEETING_MATCH_HOURS. Prefers non-canceled meetings."""
+    resp = close_get("/activity/meeting/", params={
+        "lead_id": lead_id, "_limit": 100,
+        "_fields": "id,title,starts_at,status,outcome_id"})
+    if not resp.ok:
+        return None
+    best, best_gap = None, None
+    for m in resp.json().get("data", []):
+        raw = m.get("starts_at")
+        if not raw:
+            continue
+        try:
+            st = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if m.get("status") == "canceled" or \
+                (m.get("title") or "").strip().lower().startswith("canceled"):
+            continue
+        gap = abs((st - avoma_start).total_seconds())
+        if gap <= MEETING_MATCH_HOURS * 3600 and (best_gap is None or gap < best_gap):
+            best, best_gap = m, gap
+    return best
+
+
+def write_meeting_outcome(lead_id, meeting, outcome_label):
+    """
+    Write Avoma's verdict onto the Close MEETING's native Outcome — the
+    source of truth for show rates. Runs every pass (Avoma tags can land
+    hours after analysis), is idempotent, and NEVER overwrites an existing
+    terminal outcome (human edits in the Close UI always win).
+    """
+    outcome_key = derive_meeting_outcome(outcome_label)
+    if not outcome_key:
+        log("No Avoma Outcome tag yet — Close Meeting Outcome untouched", indent=1)
+        return
+    avoma_start = avoma_meeting_start(meeting)
+    if not avoma_start:
+        log("⚠️  Could not parse Avoma meeting start time — outcome write skipped "
+            f"(keys tried: {AVOMA_START_KEYS})", indent=1)
+        return
+    close_m = find_close_meeting_activity(lead_id, avoma_start)
+    if not close_m:
+        log(f"⚠️  No Close meeting within ±{MEETING_MATCH_HOURS}h of Avoma start "
+            f"{avoma_start:%Y-%m-%d %H:%M}Z — outcome write skipped", indent=1)
+        return
+    current = close_m.get("outcome_id")
+    if current == OUTCOMES[outcome_key]:
+        log(f"Close Meeting Outcome already '{outcome_key}' — in sync", indent=1)
+        return
+    if current and current != OUTCOMES["scheduled"]:
+        log(f"Close Meeting Outcome already terminal ({current}) — leaving it "
+            f"(Avoma says '{outcome_label}'; review if they disagree)", indent=1)
+        return
+    if DRY_RUN:
+        log(f"DRY_RUN — would set Meeting Outcome '{outcome_key}' on "
+            f"{close_m['id']} ('{(close_m.get('title') or '')[:40]}') "
+            f"from Avoma tag '{outcome_label}'", indent=1)
+        return
+    resp = close_put(f"/activity/meeting/{close_m['id']}/",
+                     {"outcome_id": OUTCOMES[outcome_key]})
+    if resp.ok:
+        log(f"✅ Meeting Outcome set to '{outcome_key}' on {close_m['id']} "
+            f"(from Avoma tag '{outcome_label}')", indent=1)
+    else:
+        log(f"⚠️  Meeting Outcome write failed: {resp.status_code}: {resp.text[:200]}",
+            indent=1)
+
+
+# ===== Lead Qualified update (show-field write removed 2026-09-24) =====
 def get_lead_overrides(lead_id):
     fields = (
         f"id,"
-        f"custom.{FIRST_CALL_SHOW_OVERRIDE_FIELD},"
         f"custom.{QUALIFIED_OVERRIDE_FIELD},"
         f"custom.{QUALIFIED_FIELD}"
     )
     resp = close_get(f"/lead/{lead_id}/", params={"_fields": fields})
     if not resp.ok:
-        return {"show_override": None, "qualified_override": None, "qualified_current": None}
+        return {"qualified_override": None, "qualified_current": None}
     data = resp.json()
     return {
-        "show_override": data.get(f"custom.{FIRST_CALL_SHOW_OVERRIDE_FIELD}"),
         "qualified_override": data.get(f"custom.{QUALIFIED_OVERRIDE_FIELD}"),
         "qualified_current": data.get(f"custom.{QUALIFIED_FIELD}"),
     }
 
 
-def update_lead_show_and_qualified(lead_id, meeting, segments, outcome_label):
-    show_value = derive_show_value(meeting, segments, outcome_label)
+def update_lead_qualified(lead_id, outcome_label):
     qualified_value = derive_qualified_value(outcome_label)
-
-    if show_value is None and qualified_value is None:
-        log("No interpretable attendance/outcome signal; skipping lead update", indent=1)
+    if qualified_value is None:
         return {}
 
     overrides = get_lead_overrides(lead_id)
-    payload = {}
-
-    if show_value is not None:
-        if (overrides["show_override"] or "").lower() == "yes":
-            log("First Call Show Up Override is 'Yes' — leaving field untouched", indent=1)
-        else:
-            payload[f"custom.{FIRST_CALL_SHOW_FIELD}"] = show_value
-
-    if qualified_value is not None:
-        if (overrides["qualified_override"] or "").lower() == "yes":
-            log("Qualified Override is 'Yes' — leaving field untouched", indent=1)
-        elif overrides["qualified_current"]:
-            log(
-                f"Qualified already set to {overrides['qualified_current']!r} — leaving field untouched (rep judgment wins)",
-                indent=1,
-            )
-        else:
-            payload[f"custom.{QUALIFIED_FIELD}"] = qualified_value
-
-    if not payload:
+    if (overrides["qualified_override"] or "").lower() == "yes":
+        log("Qualified Override is 'Yes' — leaving field untouched", indent=1)
+        return {}
+    if overrides["qualified_current"]:
+        log(
+            f"Qualified already set to {overrides['qualified_current']!r} — leaving field untouched (rep judgment wins)",
+            indent=1,
+        )
         return {}
 
+    payload = {f"custom.{QUALIFIED_FIELD}": qualified_value}
     if DRY_RUN:
         log(f"DRY_RUN — would PUT lead {lead_id} with: {payload}", indent=1)
         return payload
@@ -663,14 +742,7 @@ def update_lead_show_and_qualified(lead_id, meeting, segments, outcome_label):
     if not resp.ok:
         log(f"⚠️  Failed to update lead {lead_id}: {resp.status_code}: {resp.text[:300]}", indent=1)
         return {}
-
-    friendly = {}
-    for k, v in payload.items():
-        if k == f"custom.{FIRST_CALL_SHOW_FIELD}":
-            friendly["First Call Show Up"] = v
-        elif k == f"custom.{QUALIFIED_FIELD}":
-            friendly["Qualified"] = v
-    return friendly
+    return {"Qualified": qualified_value}
 
 
 # ===== Anthropic (Claude Haiku) — unchanged =====
@@ -832,27 +904,8 @@ def process_meeting(meeting, type_info):
         log("→ Not a first sales call (handled by another sync), skip", indent=1)
         return ("skipped", "title-filter")
 
-    # 2. Require completed analysis
-    evaluations = avoma_get_scorecard_evaluations(uuid)
-    notes_raw = avoma_get_notes(uuid)
-    notes = parse_avoma_notes(notes_raw)
-    log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
-    if not evaluations and not notes:
-        if not ALLOW_INCOMPLETE_ANALYSIS:
-            log("→ Avoma analysis not yet complete (no scorecard evaluations, no notes), skip", indent=1)
-            return ("skipped", "not-analyzed")
-        log(
-            "→ Avoma analysis not yet complete, but ALLOW_INCOMPLETE_ANALYSIS=1 — "
-            "proceeding with only the fields available now (round-trip test mode). "
-            "NOTE: this Custom Activity will NOT be auto-enriched later once real "
-            "analysis exists — the idempotency check will see it already exists "
-            "and skip creating an updated one. Test-only, not for the scheduled cron.",
-            indent=1,
-        )
-    if not notes:
-        log("Note: no parsed notes (likely setter-style scorecard or unrecognized notes shape); proceeding with scorecard-only fields", indent=1)
-
-    # 3. Resolve Close lead
+    # 2. Resolve Close lead (needed for the outcome write even when the
+    #    Custom Activity turns out to be a duplicate)
     prospect_email = get_prospect_email(meeting)
     matched_lead = None
     match_method = None
@@ -873,17 +926,46 @@ def process_meeting(meeting, type_info):
     lead_name = matched_lead.get("display_name", "Unknown")
     log(f"Matched lead: {lead_name} ({lead_id}) via {match_method}", indent=1)
 
-    # 4. Idempotency
+    # 3. Meeting Outcome write — EVERY pass, before any dedupe/skip logic.
+    #    Avoma's tag can land hours after the Custom Activity was created,
+    #    so duplicates must still get their outcome synced. Never
+    #    overwrites a terminal outcome, so re-running is free.
+    outcome_label = extract_outcome_label(meeting)
+    log(f"Outcome: {outcome_label!r}", indent=1)
+    write_meeting_outcome(lead_id, meeting, outcome_label)
+    update_lead_qualified(lead_id, outcome_label)
+
+    # 4. Require completed analysis for the Custom Activity portion
+    evaluations = avoma_get_scorecard_evaluations(uuid)
+    notes_raw = avoma_get_notes(uuid)
+    notes = parse_avoma_notes(notes_raw)
+    log(f"Parsed notes categories: {list(notes.keys())}", indent=1)
+    if not evaluations and not notes:
+        if not ALLOW_INCOMPLETE_ANALYSIS:
+            log("→ Avoma analysis not yet complete (no scorecard evaluations, no notes), skip CA", indent=1)
+            return ("skipped", "not-analyzed")
+        log(
+            "→ Avoma analysis not yet complete, but ALLOW_INCOMPLETE_ANALYSIS=1 — "
+            "proceeding with only the fields available now (round-trip test mode). "
+            "NOTE: this Custom Activity will NOT be auto-enriched later once real "
+            "analysis exists — the idempotency check will see it already exists "
+            "and skip creating an updated one. Test-only, not for the scheduled cron.",
+            indent=1,
+        )
+    if not notes:
+        log("Note: no parsed notes (likely setter-style scorecard or unrecognized notes shape); proceeding with scorecard-only fields", indent=1)
+
+    # 5. Idempotency (Custom Activity only — outcome sync already done above)
     field_ids = type_info["fields"]
     call_id_field_id = field_ids.get(CLOSE_FIELD_NAMES["call_id"])
     if not call_id_field_id:
         log(f"→ '{CLOSE_FIELD_NAMES['call_id']}' field not found in Custom Activity Type, abort", indent=1)
         return ("skipped", "missing-field")
     if custom_activity_already_exists(lead_id, type_info["id"], uuid, call_id_field_id):
-        log("→ Custom Activity already exists for this meeting, skip", indent=1)
+        log("→ Custom Activity already exists for this meeting, skip CA (outcome still synced above)", indent=1)
         return ("skipped", "duplicate")
 
-    # 5. Pull analysis fields
+    # 6. Pull analysis fields
     qa_score = extract_qa_score(evaluations)
     doubt_text = get_note_value(notes, DOUBT_ANALOG_CATEGORY)
     # Call Summary = every parsed category concatenated, not just one
@@ -891,7 +973,7 @@ def process_meeting(meeting, type_info):
     call_summary = build_full_call_summary(notes)
     log(f"Call summary length: {len(call_summary)} chars across {len(notes)} categories", indent=1)
 
-    # 6. Haiku enrichment
+    # 7. Haiku enrichment
     log("Classifying Primary Objection (Haiku)...", indent=1)
     primary_objection = haiku_classify_objection(doubt_text)
     log(f"→ {primary_objection}", indent=2)
@@ -900,8 +982,6 @@ def process_meeting(meeting, type_info):
     key_concern = haiku_summarize_concern(doubt_text)
     log(f"→ {key_concern[:120]}", indent=2)
 
-    outcome_label = extract_outcome_label(meeting)
-    log(f"Outcome: {outcome_label!r}", indent=1)
     lost_reason = ""
     if is_lost_outcome(outcome_label):
         log("→ Indicates loss; summarizing Lost Reason (Haiku)...", indent=2)
@@ -909,7 +989,7 @@ def process_meeting(meeting, type_info):
         lost_reason = haiku_summarize_lost_reason(deal_summary, call_summary, doubt_text)
         log(f"→ {lost_reason[:120]}", indent=2)
 
-    # 7. Build payload
+    # 8. Build payload
     avoma_link = f"https://app.avoma.com/meetings/{uuid}"  # ASSUMPTION — unconfirmed URL format
     field_mapping = {
         CLOSE_FIELD_NAMES["call_link"]: avoma_link,
@@ -935,8 +1015,6 @@ def process_meeting(meeting, type_info):
     if DRY_RUN:
         log("DRY_RUN — would POST payload:", indent=1)
         log(json.dumps(payload, indent=2)[:1500], indent=2)
-        segments = avoma_get_meeting_segments(uuid)
-        update_lead_show_and_qualified(lead_id, meeting, segments, outcome_label)
         return ("skipped", "dry-run")
 
     resp = close_post("/activity/custom/", payload)
@@ -945,11 +1023,6 @@ def process_meeting(meeting, type_info):
 
     activity_id = resp.json().get("id")
     log(f"✅ Created Custom Activity {activity_id} on lead '{lead_name}'", indent=1)
-
-    segments = avoma_get_meeting_segments(uuid)
-    updates = update_lead_show_and_qualified(lead_id, meeting, segments, outcome_label)
-    if updates:
-        log(f"Updated lead fields: {updates}", indent=1)
 
     return ("enriched", activity_id)
 
