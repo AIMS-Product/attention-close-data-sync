@@ -106,6 +106,11 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 INTERNAL_DOMAIN = "@modern-amenities.com"
+# All company-side domains — attendees on these are never the prospect.
+# (Reps/calendars also live on vendingpreneurs.com/.co, e.g. the webinar
+# account and scheduling@ — confirmed in the Zoom attendance work.)
+INTERNAL_DOMAINS = ("@modern-amenities.com", "@vendingpreneurs.com",
+                    "@vendingpreneurs.co")
 
 # ---- Close-side naming (see assumption #1) ----
 CUSTOM_ACTIVITY_TYPE_NAME = "Attention - First Meeting Analysis"
@@ -517,7 +522,7 @@ def get_prospect_email(meeting):
             if not p["is_rep"]:
                 return email
             continue
-        if INTERNAL_DOMAIN not in email:
+        if not any(d in email for d in INTERNAL_DOMAINS):
             return email
     return None
 
