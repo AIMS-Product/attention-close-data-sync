@@ -87,6 +87,7 @@ import sys
 import re
 import time
 import json
+import argparse
 import base64
 import requests
 from datetime import datetime, timezone, timedelta
@@ -94,7 +95,7 @@ from datetime import datetime, timezone, timedelta
 # ===== Config =====
 CLOSE_API_KEY = os.environ["CLOSE_API_KEY"]
 AVOMA_API_KEY = os.environ["AVOMA_API_KEY"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 HOURS_BACK = int(os.environ.get("HOURS_BACK", "24"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 ALLOW_INCOMPLETE_ANALYSIS = os.environ.get("ALLOW_INCOMPLETE_ANALYSIS", "0") == "1"
@@ -671,30 +672,30 @@ def write_meeting_outcome(lead_id, meeting, outcome_label):
     outcome_key = derive_meeting_outcome(outcome_label)
     if not outcome_key:
         log("No Avoma Outcome tag yet — Close Meeting Outcome untouched", indent=1)
-        return
+        return False
     avoma_start = avoma_meeting_start(meeting)
     if not avoma_start:
         log("⚠️  Could not parse Avoma meeting start time — outcome write skipped "
             f"(keys tried: {AVOMA_START_KEYS})", indent=1)
-        return
+        return False
     close_m = find_close_meeting_activity(lead_id, avoma_start)
     if not close_m:
         log(f"⚠️  No Close meeting within ±{MEETING_MATCH_HOURS}h of Avoma start "
             f"{avoma_start:%Y-%m-%d %H:%M}Z — outcome write skipped", indent=1)
-        return
+        return False
     current = close_m.get("outcome_id")
     if current == OUTCOMES[outcome_key]:
         log(f"Close Meeting Outcome already '{outcome_key}' — in sync", indent=1)
-        return
+        return True
     if current and current != OUTCOMES["scheduled"]:
         log(f"Close Meeting Outcome already terminal ({current}) — leaving it "
             f"(Avoma says '{outcome_label}'; review if they disagree)", indent=1)
-        return
+        return False
     if DRY_RUN:
         log(f"DRY_RUN — would set Meeting Outcome '{outcome_key}' on "
             f"{close_m['id']} ('{(close_m.get('title') or '')[:40]}') "
             f"from Avoma tag '{outcome_label}'", indent=1)
-        return
+        return True
     resp = close_put(f"/activity/meeting/{close_m['id']}/",
                      {"outcome_id": OUTCOMES[outcome_key]})
     if resp.ok:
@@ -703,6 +704,7 @@ def write_meeting_outcome(lead_id, meeting, outcome_label):
     else:
         log(f"⚠️  Meeting Outcome write failed: {resp.status_code}: {resp.text[:200]}",
             indent=1)
+    return resp.ok
 
 
 # ===== Lead Qualified update (show-field write removed 2026-09-24) =====
@@ -898,7 +900,7 @@ def custom_activity_already_exists(lead_id, type_id, avoma_meeting_uuid, call_id
 
 
 # ===== Enrichment =====
-def process_meeting(meeting, type_info):
+def process_meeting(meeting, type_info, *, outcome_only=False):
     uuid = meeting.get("uuid", "")
     title = meeting.get("subject", "")
 
@@ -937,7 +939,9 @@ def process_meeting(meeting, type_info):
     #    overwrites a terminal outcome, so re-running is free.
     outcome_label = extract_outcome_label(meeting)
     log(f"Outcome: {outcome_label!r}", indent=1)
-    write_meeting_outcome(lead_id, meeting, outcome_label)
+    outcome_synced = write_meeting_outcome(lead_id, meeting, outcome_label)
+    if outcome_only:
+        return ("outcome-synced", "outcome-only") if outcome_synced else ("skipped", "outcome-not-synced")
     update_lead_qualified(lead_id, outcome_label)
 
     # 4. Require completed analysis for the Custom Activity portion
@@ -1033,19 +1037,25 @@ def process_meeting(meeting, type_info):
 
 
 # ===== Main =====
-def main():
+def main(*, outcome_only=False):
+    if not outcome_only and not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY is required for analysis enrichment")
+
     section(
-        f"Avoma → Close first-meeting sync (HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN}, "
+        f"Avoma → Close first-meeting sync{' (outcome only)' if outcome_only else ''} "
+        f"(HOURS_BACK={HOURS_BACK}, DRY_RUN={DRY_RUN}, "
         f"ALLOW_INCOMPLETE_ANALYSIS={ALLOW_INCOMPLETE_ANALYSIS})"
     )
 
-    section("Resolving Close Custom Activity Type")
-    type_info = find_custom_activity_type()
-    log(f"Type:   {CUSTOM_ACTIVITY_TYPE_NAME}")
-    log(f"ID:     {type_info['id']}")
-    log(f"Fields ({len(type_info['fields'])}):")
-    for name, field_id in sorted(type_info["fields"].items()):
-        log(f"  {name}: {field_id}", indent=1)
+    type_info = None
+    if not outcome_only:
+        section("Resolving Close Custom Activity Type")
+        type_info = find_custom_activity_type()
+        log(f"Type:   {CUSTOM_ACTIVITY_TYPE_NAME}")
+        log(f"ID:     {type_info['id']}")
+        log(f"Fields ({len(type_info['fields'])}):")
+        for name, field_id in sorted(type_info["fields"].items()):
+            log(f"  {name}: {field_id}", indent=1)
 
     until_dt = datetime.now(timezone.utc)
     since_dt = until_dt - timedelta(hours=HOURS_BACK)
@@ -1054,14 +1064,16 @@ def main():
     log(f"Total returned: {len(meetings)}")
 
     section("Processing meetings")
-    stats = {"enriched": 0, "skipped": 0, "failed": 0}
+    stats = {"enriched": 0, "outcome_synced": 0, "skipped": 0, "failed": 0}
     skip_reasons = {}
 
     for meeting in meetings:
         try:
-            outcome, detail = process_meeting(meeting, type_info)
+            outcome, detail = process_meeting(meeting, type_info, outcome_only=outcome_only)
             if outcome == "enriched":
                 stats["enriched"] += 1
+            elif outcome == "outcome-synced":
+                stats["outcome_synced"] += 1
             else:
                 stats["skipped"] += 1
                 skip_reasons[detail] = skip_reasons.get(detail, 0) + 1
@@ -1071,6 +1083,8 @@ def main():
             log(f"❌ Error processing {meeting_id}: {e}", indent=1)
 
     section("Done")
+    if outcome_only:
+        log(f"Outcome records processed: {stats['outcome_synced']}")
     log(f"Enriched: {stats['enriched']}")
     log(f"Skipped:  {stats['skipped']}")
     for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
@@ -1081,4 +1095,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Sync Avoma first-meeting outcomes and analysis to Close")
+    parser.add_argument(
+        "--outcome-only",
+        action="store_true",
+        help="Sync Avoma meeting outcomes to Close without analysis enrichment or Anthropic",
+    )
+    main(outcome_only=parser.parse_args().outcome_only)
