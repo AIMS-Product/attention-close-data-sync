@@ -598,7 +598,7 @@ def derive_qualified_value(outcome_label):
     if not outcome_label:
         return None
     lower = outcome_label.lower()
-    if "disqualified" in lower:
+    if "disqualified" in lower or "unqualified" in lower:
         return "No"
     if "one call close" in lower:
         return "Yes"

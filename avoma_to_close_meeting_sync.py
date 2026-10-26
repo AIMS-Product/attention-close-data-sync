@@ -73,13 +73,17 @@ docs for the full write-up):
    a genuine "Qualified" Outcome was tagged on a follow-up call (Marty
    Tezen / Luke Herman) whose title lacked the "vendingpren" first-sale
    marker, so it landed here, in avoma_to_close_meeting_sync.py, which
-   had nowhere to put that signal. update_lead_qualified() now runs
-   unconditionally (any meeting_type, not just Follow-up), and never
+   had nowhere to put that signal. update_lead_qualified() handles
+   eligible non-setter types, not just Follow-up, and never
    touches FIRST_CALL_SHOW_FIELD / FIRST_CALL_SHOW_OVERRIDE_FIELD — those
    stay exclusive to the first-meeting sync. Separately,
    classify_meeting_type() now accepts an optional Avoma `purpose.label`
    fallback, used ONLY when title-keyword matching alone would return
    "Other" — title stays the primary signal per explicit instruction.
+
+8. SETTER / DISCOVERY OUTCOMES: these calls are not qualification events.
+   The sync still records their analysis activities, but skips lead-level
+   Qualified updates for meetings classified as Setter or Discovery.
 
    OVERWRITE RULE (refined 2026-09-16, same day, by explicit follow-up
    request): unlike update_lead_show_and_qualified() in the sibling
@@ -648,6 +652,8 @@ def _classify_from_title(text):
         return "Follow-up"
     if "discovery" in lower:
         return "Discovery"
+    if "route planning" in lower:
+        return "Setter"
     if "next steps" in lower or "next step" in lower:
         return "Next Steps"
     if "setter" in lower:
@@ -735,7 +741,7 @@ def derive_qualified_value(outcome_label):
     if not outcome_label:
         return None
     lower = outcome_label.lower()
-    if "disqualified" in lower:
+    if "disqualified" in lower or "unqualified" in lower:
         return "No"
     if "one call close" in lower:
         return "Yes"
@@ -764,7 +770,7 @@ def get_lead_qualified_override(lead_id):
     }
 
 
-def update_lead_qualified(lead_id, outcome_label):
+def update_lead_qualified(lead_id, outcome_label, meeting_type="Other"):
     """
     ADDED 2026-09-16 — extends Qualified-writing beyond the first call.
     Real-world evidence: a genuine "Qualified" Outcome was tagged on a
@@ -787,9 +793,13 @@ def update_lead_qualified(lead_id, outcome_label):
     to Yes, or a later call's sync will silently overwrite their
     correction again.
 
-    Called unconditionally — Qualified can come from Discovery, Setter,
-    Next Steps, or Other meeting types, not just Follow-up.
+    Setter and Discovery outcomes are ignored. Qualification applies to
+    sales calls and follow-ups, not the setter's screening call.
     """
+    if meeting_type in ("Setter", "Discovery"):
+        log(f"Skipping Qualified update for {meeting_type} call", indent=1)
+        return {}
+
     qualified_value = derive_qualified_value(outcome_label)
     if qualified_value is None:
         return {}
@@ -1040,6 +1050,9 @@ def process_meeting(meeting, type_info):
     """
     uuid = meeting.get("uuid", "")
     title = meeting.get("subject", "")
+    purpose = meeting.get("purpose")
+    avoma_purpose_label = purpose.get("label") if isinstance(purpose, dict) else None
+    meeting_type = classify_meeting_type(title, avoma_purpose_label)
 
     log(f"\n[{uuid}] '{title}'")
 
@@ -1128,9 +1141,6 @@ def process_meeting(meeting, type_info):
     # 7. Classify Meeting Type — title is primary; Avoma's native purpose
     # field is only a fallback when the title alone is ambiguous (see
     # classify_meeting_type() docstring — assumption #7).
-    purpose = meeting.get("purpose")
-    avoma_purpose_label = purpose.get("label") if isinstance(purpose, dict) else None
-    meeting_type = classify_meeting_type(title, avoma_purpose_label)
     log(f"Meeting Type: {meeting_type}" + (f" (purpose fallback: {avoma_purpose_label!r})" if avoma_purpose_label and _classify_from_title(title) == "Other" else ""), indent=1)
 
     # 8. Build payload
@@ -1175,10 +1185,8 @@ def process_meeting(meeting, type_info):
                     log(f"Would update Follow Up Call Show {projected_slot} = {show_value!r}", indent=1)
         else:
             log(f"Meeting Type is {meeting_type!r}; no follow-up slot update applies", indent=1)
-        # Qualified-writing (ADDED 2026-09-16) is unconditional on
-        # meeting_type — reuses the override-respecting update function,
-        # which itself honors DRY_RUN for the actual PUT.
-        update_lead_qualified(lead_id, outcome_label)
+        # Qualified-writing skips setter/discovery calls and honors DRY_RUN.
+        update_lead_qualified(lead_id, outcome_label, meeting_type)
         return ("skipped", "dry-run")
 
     resp = close_post("/activity/custom/", payload)
@@ -1203,11 +1211,9 @@ def process_meeting(meeting, type_info):
                 if ok:
                     log(f"Updated Follow Up Call Show {count} = {show_value!r}", indent=1)
 
-    # Qualified-writing (ADDED 2026-09-16) — unconditional on meeting_type,
-    # since Qualified/Disqualified can be tagged on Discovery, Setter,
-    # Next Steps, or Other calls too, not just Follow-up. Does NOT touch
-    # First Call Show Up (exclusive to avoma_to_close_first_meeting_sync.py).
-    qualified_result = update_lead_qualified(lead_id, outcome_label)
+    # Qualified-writing skips setter/discovery calls. Does NOT touch First
+    # Call Show Up (exclusive to avoma_to_close_first_meeting_sync.py).
+    qualified_result = update_lead_qualified(lead_id, outcome_label, meeting_type)
     if qualified_result:
         log(f"Updated lead fields: {qualified_result}", indent=1)
 
