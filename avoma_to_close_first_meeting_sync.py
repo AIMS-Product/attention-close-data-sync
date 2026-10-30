@@ -24,11 +24,11 @@ UPDATED 2026-09-24 — MEETING OUTCOME IS NOW THE SOURCE OF TRUTH:
     First Call Show (Override) field remains untouched by automation.
     Qualified handling is unchanged.
 
-Filter (must satisfy ALL):
-  - Subject contains "vendingpren" (the first-sale marker)
-  - Subject does NOT contain any FIRST_SALE_EXCLUSION_KEYWORDS
-  This mirrors avoma_to_close_meeting_sync.py's is_first_sale_title()
-  exactly — keep the two in sync.
+Outcome filter: Vendingpreneurs and Acquisition Ace (including AA) titles
+are eligible. Existing discovery and follow-up exclusions apply only to
+Vendingpreneurs. Analysis enrichment and lead-level qualification remain
+Vendingpreneurs-only; Acquisition Ace uses this workflow only to sync
+Avoma's tagged meeting outcome.
 
 ============================================================================
 READ THIS FIRST — same assumption set as avoma_to_close_meeting_sync.py
@@ -508,6 +508,30 @@ def is_first_sale_title(title):
     return True
 
 
+def offer_family_from_title(title):
+    """Return a stable offer family for Avoma/Close title cross-checks."""
+    lower = clean_title(title or "").lower()
+    if FIRST_SALE_TITLE_MARKER in lower:
+        return "vendingpreneurs"
+    if re.search(r"\bacquisition\s+ace\b|\baa\b", lower):
+        return "acquisition_ace"
+    return None
+
+
+def is_supported_outcome_title(title):
+    if not title:
+        return False
+    family = offer_family_from_title(title)
+    if not family:
+        return False
+    lower = clean_title(title).lower()
+    if family == "vendingpreneurs" and any(
+        kw in lower for kw in FIRST_SALE_EXCLUSION_KEYWORDS
+    ):
+        return False
+    return True
+
+
 # ===== Avoma data extraction =====
 def get_prospect_email(meeting):
     """UNVERIFIED against the meetings endpoint — see the sibling meeting
@@ -636,7 +660,7 @@ def avoma_meeting_start(meeting):
     return None
 
 
-def find_close_meeting_activity(lead_id, avoma_start):
+def find_close_meeting_activity(lead_id, avoma_start, required_offer=None):
     """The Close meeting activity on this lead nearest the Avoma meeting's
     start, within MEETING_MATCH_HOURS. Prefers non-canceled meetings."""
     resp = close_get("/activity/meeting/", params={
@@ -645,6 +669,7 @@ def find_close_meeting_activity(lead_id, avoma_start):
     if not resp.ok:
         return None
     best, best_gap = None, None
+    tied_best = False
     for m in resp.json().get("data", []):
         raw = m.get("starts_at")
         if not raw:
@@ -656,13 +681,20 @@ def find_close_meeting_activity(lead_id, avoma_start):
         if m.get("status") == "canceled" or \
                 (m.get("title") or "").strip().lower().startswith("canceled"):
             continue
+        if required_offer and offer_family_from_title(m.get("title")) != required_offer:
+            continue
         gap = abs((st - avoma_start).total_seconds())
-        if gap <= MEETING_MATCH_HOURS * 3600 and (best_gap is None or gap < best_gap):
-            best, best_gap = m, gap
+        if gap <= MEETING_MATCH_HOURS * 3600:
+            if best_gap is None or gap < best_gap:
+                best, best_gap, tied_best = m, gap, False
+            elif gap == best_gap:
+                tied_best = True
+    if tied_best:
+        return None
     return best
 
 
-def write_meeting_outcome(lead_id, meeting, outcome_label):
+def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer=None):
     """
     Write Avoma's verdict onto the Close MEETING's native Outcome — the
     source of truth for show rates. Runs every pass (Avoma tags can land
@@ -678,7 +710,9 @@ def write_meeting_outcome(lead_id, meeting, outcome_label):
         log("⚠️  Could not parse Avoma meeting start time — outcome write skipped "
             f"(keys tried: {AVOMA_START_KEYS})", indent=1)
         return False
-    close_m = find_close_meeting_activity(lead_id, avoma_start)
+    close_m = find_close_meeting_activity(
+        lead_id, avoma_start, required_offer=required_offer
+    )
     if not close_m:
         log(f"⚠️  No Close meeting within ±{MEETING_MATCH_HOURS}h of Avoma start "
             f"{avoma_start:%Y-%m-%d %H:%M}Z — outcome write skipped", indent=1)
@@ -850,7 +884,7 @@ def find_custom_activity_type():
 
 
 # ===== Close lead matching =====
-def find_close_lead_by_email(email):
+def find_close_lead_by_email(email, *, require_unique=False):
     if not email:
         return None
     resp = close_get(
@@ -859,7 +893,10 @@ def find_close_lead_by_email(email):
     )
     if not resp.ok:
         return None
-    leads = resp.json().get("data", [])
+    payload = resp.json()
+    leads = payload.get("data", [])
+    if require_unique and (payload.get("has_more") or len(leads) != 1):
+        return None
     return leads[0] if leads else None
 
 
@@ -906,10 +943,13 @@ def process_meeting(meeting, type_info, *, outcome_only=False):
 
     log(f"\n[{uuid}] '{title}'")
 
-    # 1. Title filter — keep only first sales calls
-    if not is_first_sale_title(title):
-        log("→ Not a first sales call (handled by another sync), skip", indent=1)
+    # 1. Outcome title filter. The non-VP offers are outcome-only here;
+    #    first-meeting analysis and qualification remain VP-only.
+    if not is_supported_outcome_title(title):
+        log("→ Title does not identify a supported offer, skip", indent=1)
         return ("skipped", "title-filter")
+
+    offer_family = offer_family_from_title(title)
 
     # 2. Resolve Close lead (needed for the outcome write even when the
     #    Custom Activity turns out to be a duplicate)
@@ -917,10 +957,12 @@ def process_meeting(meeting, type_info, *, outcome_only=False):
     matched_lead = None
     match_method = None
     if prospect_email:
-        matched_lead = find_close_lead_by_email(prospect_email)
+        matched_lead = find_close_lead_by_email(
+            prospect_email, require_unique=offer_family == "acquisition_ace"
+        )
         if matched_lead:
             match_method = f"email ({prospect_email})"
-    if not matched_lead:
+    if not matched_lead and offer_family == "vendingpreneurs":
         matched_lead = find_close_lead_by_title(title)
         if matched_lead:
             extracted = extract_prospect_name_from_title(title)
@@ -939,9 +981,16 @@ def process_meeting(meeting, type_info, *, outcome_only=False):
     #    overwrites a terminal outcome, so re-running is free.
     outcome_label = extract_outcome_label(meeting)
     log(f"Outcome: {outcome_label!r}", indent=1)
-    outcome_synced = write_meeting_outcome(lead_id, meeting, outcome_label)
+    outcome_synced = write_meeting_outcome(
+        lead_id,
+        meeting,
+        outcome_label,
+        required_offer=offer_family if offer_family != "vendingpreneurs" else None,
+    )
     if outcome_only:
         return ("outcome-synced", "outcome-only") if outcome_synced else ("skipped", "outcome-not-synced")
+    if not is_first_sale_title(title):
+        return ("outcome-synced", "offer-outcome-only") if outcome_synced else ("skipped", "offer-outcome-not-synced")
     update_lead_qualified(lead_id, outcome_label)
 
     # 4. Require completed analysis for the Custom Activity portion

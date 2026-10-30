@@ -48,6 +48,9 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
+      - name: Verify attendance sync rules
+        run: python3 -m unittest test_first_meeting_outcome_rules.py -v
+
       - name: Run first meeting sync
         env:
           CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
