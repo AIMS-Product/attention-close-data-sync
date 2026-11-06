@@ -1,0 +1,51 @@
+name: Avoma → Close Outcome Reconciliation
+
+on:
+  schedule:
+    # Recheck Avoma tags every six hours so late outcomes get another pass.
+    - cron: '17 2,8,14,20 * * *'
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: 'Avoma meeting history to reconcile, in hours'
+        required: false
+        default: '24'
+      dry_run:
+        description: 'Dry run (1 = no Close writes)'
+        required: false
+        default: '1'
+
+concurrency:
+  group: avoma-to-close-first-meeting-sync
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install requests
+
+      - name: Reconcile Avoma outcomes
+        env:
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
+          HOURS_BACK: ${{ inputs.hours_back || '24' }}
+          DRY_RUN: ${{ inputs.dry_run || '0' }}
+        run: python3 -u avoma_to_close_first_meeting_sync.py --outcome-only
+
+      - name: Upload outcome review queue
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: avoma-outcome-review-${{ github.run_id }}
+          path: avoma_outcome_review.json
+          if-no-files-found: warn
+          retention-days: 90

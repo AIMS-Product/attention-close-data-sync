@@ -8,12 +8,8 @@ level Qualified field (honoring its override field).
 
 UPDATED 2026-09-24 — MEETING OUTCOME IS NOW THE SOURCE OF TRUTH:
   * NEW: write_meeting_outcome() maps Avoma's native Outcome tag
-    (Show / No-Show / Rescheduled / Qualified / Disqualified / ...) onto
-    the Close MEETING's native Meeting Outcome (outcome_id):
-        No-Show-ish            -> No Show
-        Rescheduled-ish        -> Rescheduled
-        Canceled-ish           -> Cancelled
-        any other real tag     -> Completed  (a tagged conversation happened)
+    onto the Close MEETING's native Meeting Outcome (outcome_id) using an
+    explicit normalized allowlist. Unknown labels go to a review artifact.
     Runs on every pass — including when the Custom Activity already
     exists — because Avoma's tag can land hours after analysis. Never
     overwrites an existing terminal outcome (human edits win).
@@ -24,11 +20,11 @@ UPDATED 2026-09-24 — MEETING OUTCOME IS NOW THE SOURCE OF TRUTH:
     First Call Show (Override) field remains untouched by automation.
     Qualified handling is unchanged.
 
-Outcome filter: Vendingpreneurs and Acquisition Ace (including AA) titles
-are eligible. Existing discovery and follow-up exclusions apply only to
-Vendingpreneurs. Analysis enrichment and lead-level qualification remain
-Vendingpreneurs-only; Acquisition Ace uses this workflow only to sync
-Avoma's tagged meeting outcome.
+Outcome filter: Vendingpreneurs, Acquisition Ace (including AA), TLG, PPA,
+Land Geek, and Publishing Profits titles are eligible. Existing discovery and
+follow-up exclusions apply only to Vendingpreneurs. Analysis enrichment and
+lead-level qualification remain Vendingpreneurs-only; the other offers use
+this workflow only to sync Avoma's tagged meeting outcome.
 
 ============================================================================
 READ THIS FIRST — same assumption set as avoma_to_close_meeting_sync.py
@@ -91,6 +87,13 @@ import argparse
 import base64
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from avoma_outcome_rules import (
+    cancellation_outcome,
+    derive_meeting_outcome,
+    select_unique_close_meeting,
+    terminal_outcome_action,
+)
 
 # ===== Config =====
 CLOSE_API_KEY = os.environ["CLOSE_API_KEY"]
@@ -304,7 +307,7 @@ def avoma_list_meetings(since_dt, until_dt):
     meetings = []
     url = "/meetings/"
     next_params = params
-    for _ in range(500):
+    for page_number in range(1, 501):
         resp = avoma_get(url, params=next_params)
         if not resp.ok:
             raise Exception(f"Avoma meetings list returned {resp.status_code}: {resp.text[:300]}")
@@ -313,6 +316,10 @@ def avoma_list_meetings(since_dt, until_dt):
         next_url = body.get("next")
         if not next_url:
             break
+        if page_number == 500:
+            raise RuntimeError(
+                "Avoma meeting pagination exceeded 500 pages; results were truncated"
+            )
         url = next_url
         next_params = None
     return meetings
@@ -515,21 +522,18 @@ def offer_family_from_title(title):
         return "vendingpreneurs"
     if re.search(r"\bacquisition\s+ace\b|\baa\b", lower):
         return "acquisition_ace"
+    if re.search(r"\btlg\b|\bland\s+geek\b", lower):
+        return "tlg"
+    if re.search(r"\bppa\b|\bpublishing\s+profits\b", lower):
+        return "ppa"
     return None
 
 
 def is_supported_outcome_title(title):
+    """Allow every supported offer meeting, including follow-ups/reschedules, for outcome sync."""
     if not title:
         return False
-    family = offer_family_from_title(title)
-    if not family:
-        return False
-    lower = clean_title(title).lower()
-    if family == "vendingpreneurs" and any(
-        kw in lower for kw in FIRST_SALE_EXCLUSION_KEYWORDS
-    ):
-        return False
-    return True
+    return offer_family_from_title(title) is not None
 
 
 # ===== Avoma data extraction =====
@@ -590,29 +594,6 @@ def extract_outcome_label(meeting):
     return ""
 
 
-def derive_meeting_outcome(outcome_label):
-    """
-    Avoma Outcome tag -> Close Meeting Outcome key (or None = don't write).
-
-    Negative/branch tags first; then ANY other real (non-empty) tag means
-    the meeting happened with enough substance for the AI/rep to classify
-    it at all -> Completed. This mirrors the Show/No-Show definitions
-    configured in Avoma (Settings > Purposes and Outcomes): "Show",
-    "Qualified", "Disqualified", "One Call Close", even "Not Interested"
-    all imply a real two-way conversation took place.
-    """
-    if not outcome_label:
-        return None
-    lower = outcome_label.lower()
-    if "no-show" in lower or "no show" in lower or "ghost" in lower:
-        return "no_show"
-    if "reschedul" in lower:
-        return "rescheduled"
-    if "cancel" in lower:
-        return "cancelled"
-    return "completed"
-
-
 def derive_qualified_value(outcome_label):
     """
     Maps Avoma's native `outcome` field (see extract_outcome_label()) to
@@ -660,41 +641,157 @@ def avoma_meeting_start(meeting):
     return None
 
 
-def find_close_meeting_activity(lead_id, avoma_start, required_offer=None):
-    """The Close meeting activity on this lead nearest the Avoma meeting's
-    start, within MEETING_MATCH_HOURS. Prefers non-canceled meetings."""
-    resp = close_get("/activity/meeting/", params={
-        "lead_id": lead_id, "_limit": 100,
-        "_fields": "id,title,starts_at,status,outcome_id"})
-    if not resp.ok:
-        return None
-    best, best_gap = None, None
-    tied_best = False
-    for m in resp.json().get("data", []):
-        raw = m.get("starts_at")
-        if not raw:
-            continue
-        try:
-            st = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if m.get("status") == "canceled" or \
-                (m.get("title") or "").strip().lower().startswith("canceled"):
-            continue
-        if required_offer and offer_family_from_title(m.get("title")) != required_offer:
-            continue
-        gap = abs((st - avoma_start).total_seconds())
-        if gap <= MEETING_MATCH_HOURS * 3600:
-            if best_gap is None or gap < best_gap:
-                best, best_gap, tied_best = m, gap, False
-            elif gap == best_gap:
-                tied_best = True
-    if tied_best:
-        return None
-    return best
+def fetch_close_meetings_for_lead(lead_id):
+    """Read every meeting for a lead so matching and later-booking checks are complete."""
+    meetings = []
+    skip = 0
+    while True:
+        resp = close_get("/activity/meeting/", params={
+            "lead_id": lead_id,
+            "_skip": skip,
+            "_limit": 100,
+            "_fields": "id,title,starts_at,status,outcome_id,user_id",
+        })
+        if not resp.ok:
+            return None, "close_meeting_read_failed"
+        body = resp.json()
+        page = body.get("data", [])
+        meetings.extend(page)
+        if not body.get("has_more"):
+            return meetings, None
+        if not page:
+            return None, "close_meeting_pagination_incomplete"
+        skip += 100
 
 
-def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer=None):
+def fetch_close_blank_eligible_meetings(since_dt, until_dt):
+    """Enumerate past blank/default Close meetings for the daily reconciliation."""
+    eligible = []
+    skip = 0
+    fields = "id,lead_id,user_id,title,starts_at,date_created,status,outcome_id"
+    while True:
+        resp = close_get("/activity/meeting/", params={
+            "_skip": skip,
+            "_limit": 100,
+            "_fields": fields,
+        })
+        if not resp.ok:
+            raise RuntimeError("Close meeting census failed: "
+                               f"HTTP {resp.status_code}")
+        body = resp.json()
+        page = body.get("data", [])
+        page_all_old = True
+        for meeting in page:
+            title = meeting.get("title") or ""
+            current = meeting.get("outcome_id")
+            blank_or_default = not current or current == OUTCOMES["scheduled"]
+            raw_start = meeting.get("starts_at") or meeting.get("date_created")
+            if not raw_start:
+                page_all_old = False
+                if is_supported_outcome_title(title) and blank_or_default:
+                    eligible.append((meeting, "close_meeting_start_missing"))
+                continue
+            try:
+                start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+            except (AttributeError, TypeError, ValueError):
+                page_all_old = False
+                if is_supported_outcome_title(title) and blank_or_default:
+                    eligible.append((meeting, "close_meeting_start_unparseable"))
+                continue
+            if start >= since_dt:
+                page_all_old = False
+            if start < since_dt or start > until_dt:
+                continue
+            if not is_supported_outcome_title(title):
+                continue
+            if not blank_or_default:
+                continue
+            missing_activity_start = not meeting.get("starts_at")
+            eligible.append((meeting,
+                             "close_meeting_start_missing" if missing_activity_start else None))
+        if page_all_old or not body.get("has_more"):
+            return eligible
+        if not page:
+            raise RuntimeError("Close meeting pagination stopped before the census completed")
+        skip += 100
+
+
+def review_due_at(now=None):
+    """Return a 5 PM Pacific deadline on the next weekday."""
+    pacific = ZoneInfo("America/Los_Angeles")
+    local_now = (now or datetime.now(pacific)).astimezone(pacific)
+    due_date = local_now.date() + timedelta(days=1)
+    while due_date.weekday() >= 5:
+        due_date += timedelta(days=1)
+    due = datetime(due_date.year, due_date.month, due_date.day, 17, 0, tzinfo=pacific)
+    return due.isoformat()
+
+
+def add_unmatched_close_reviews(review_items, close_meetings, matched_close_ids):
+    """Route blank/default Close meetings with no unique Avoma match to review."""
+    already_reported = {
+        item.get("close_activity_id") for item in review_items
+        if item.get("close_activity_id")
+    }
+    for meeting, start_reason in close_meetings:
+        meeting_id = meeting.get("id")
+        if meeting_id in matched_close_ids or meeting_id in already_reported:
+            continue
+        lead_id = meeting.get("lead_id")
+        review_items.append({
+            "avoma_meeting_id": None,
+            "avoma_title": None,
+            "avoma_start": None,
+            "avoma_outcome_tag": "",
+            "close_lead_id": lead_id,
+            "close_lead_url": f"https://app.close.com/lead/{lead_id}/" if lead_id else None,
+            "close_owner_id": meeting.get("user_id"),
+            "close_activity_id": meeting_id,
+            "close_title": meeting.get("title"),
+            "close_starts_at": meeting.get("starts_at"),
+            "review_due_at": review_due_at(),
+            "reason": start_reason or "no_unique_avoma_match",
+        })
+        already_reported.add(meeting_id)
+
+
+def add_outcome_review(review_items, avoma_meeting, lead_id, reason, label="",
+                       close_meeting=None):
+    if review_items is None:
+        return
+    avoma_start = avoma_meeting_start(avoma_meeting)
+    review_items.append({
+        "avoma_meeting_id": avoma_meeting.get("uuid"),
+        "avoma_title": avoma_meeting.get("subject"),
+        "avoma_start": avoma_start.isoformat() if avoma_start else None,
+        "avoma_outcome_tag": label,
+        "close_lead_id": lead_id,
+        "close_lead_url": f"https://app.close.com/lead/{lead_id}/" if lead_id else None,
+        "close_owner_id": close_meeting.get("user_id") if close_meeting else None,
+        "close_activity_id": close_meeting.get("id") if close_meeting else None,
+        "close_title": close_meeting.get("title") if close_meeting else None,
+        "close_starts_at": close_meeting.get("starts_at") if close_meeting else None,
+        "review_due_at": review_due_at(),
+        "reason": reason,
+    })
+
+
+def find_close_meeting_activity(lead_id, avoma_start, required_offer):
+    """Return a unique same-offer, time-near Close meeting or an explicit review reason."""
+    meetings, error = fetch_close_meetings_for_lead(lead_id)
+    if error:
+        return None, error, []
+    match, reason = select_unique_close_meeting(
+        meetings, avoma_start, required_offer,
+        offer_family_from_title, MEETING_MATCH_HOURS,
+    )
+    return match, reason, meetings
+
+
+def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer,
+                          review_items=None, matched_close_ids=None):
     """
     Write Avoma's verdict onto the Close MEETING's native Outcome — the
     source of truth for show rates. Runs every pass (Avoma tags can land
@@ -703,33 +800,63 @@ def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer=None):
     """
     outcome_key = derive_meeting_outcome(outcome_label)
     if not outcome_key:
-        log("No Avoma Outcome tag yet — Close Meeting Outcome untouched", indent=1)
-        return False
+        reason = "missing_avoma_tag" if not outcome_label else "unknown_avoma_tag"
+        log(f"Outcome left unchanged — {reason}: {outcome_label!r}", indent=1)
+        add_outcome_review(review_items, meeting, lead_id, reason, outcome_label)
+        return False, reason
     avoma_start = avoma_meeting_start(meeting)
     if not avoma_start:
         log("⚠️  Could not parse Avoma meeting start time — outcome write skipped "
             f"(keys tried: {AVOMA_START_KEYS})", indent=1)
-        return False
-    close_m = find_close_meeting_activity(
-        lead_id, avoma_start, required_offer=required_offer
+        add_outcome_review(review_items, meeting, lead_id, "avoma_start_unparseable", outcome_label)
+        return False, "avoma_start_unparseable"
+    close_m, match_reason, lead_meetings = find_close_meeting_activity(
+        lead_id, avoma_start, required_offer
     )
-    if not close_m:
-        log(f"⚠️  No Close meeting within ±{MEETING_MATCH_HOURS}h of Avoma start "
-            f"{avoma_start:%Y-%m-%d %H:%M}Z — outcome write skipped", indent=1)
-        return False
+    if match_reason != "matched":
+        log(f"⚠️  Close meeting match requires review: {match_reason}", indent=1)
+        add_outcome_review(review_items, meeting, lead_id, match_reason, outcome_label)
+        return False, match_reason
+    if matched_close_ids is not None:
+        matched_close_ids.add(close_m["id"])
+    if outcome_key == "cancelled":
+        outcome_key = cancellation_outcome(
+            close_m, lead_meetings, required_offer, offer_family_from_title,
+            is_supported_outcome_title,
+        )
     current = close_m.get("outcome_id")
-    if current == OUTCOMES[outcome_key]:
+    action = terminal_outcome_action(current, OUTCOMES["scheduled"], OUTCOMES[outcome_key])
+    if action == "already_in_sync":
         log(f"Close Meeting Outcome already '{outcome_key}' — in sync", indent=1)
-        return True
-    if current and current != OUTCOMES["scheduled"]:
+        return True, "already_in_sync"
+    if action == "preserve_terminal":
         log(f"Close Meeting Outcome already terminal ({current}) — leaving it "
             f"(Avoma says '{outcome_label}'; review if they disagree)", indent=1)
-        return False
+        add_outcome_review(review_items, meeting, lead_id,
+                           "existing_terminal_conflict", outcome_label, close_m)
+        return False, "existing_terminal_conflict"
     if DRY_RUN:
         log(f"DRY_RUN — would set Meeting Outcome '{outcome_key}' on "
             f"{close_m['id']} ('{(close_m.get('title') or '')[:40]}') "
             f"from Avoma tag '{outcome_label}'", indent=1)
-        return True
+        return True, "dry_run_would_write"
+
+    # Close has no conditional update here, so re-read immediately before PUT.
+    fresh_resp = close_get(f"/activity/meeting/{close_m['id']}/")
+    if not fresh_resp.ok:
+        add_outcome_review(review_items, meeting, lead_id,
+                           "close_outcome_reread_failed", outcome_label, close_m)
+        return False, "close_outcome_reread_failed"
+    fresh_current = fresh_resp.json().get("outcome_id")
+    fresh_action = terminal_outcome_action(
+        fresh_current, OUTCOMES["scheduled"], OUTCOMES[outcome_key]
+    )
+    if fresh_action == "already_in_sync":
+        return True, "already_in_sync"
+    if fresh_action == "preserve_terminal":
+        add_outcome_review(review_items, meeting, lead_id,
+                           "existing_terminal_conflict", outcome_label, close_m)
+        return False, "existing_terminal_conflict"
     resp = close_put(f"/activity/meeting/{close_m['id']}/",
                      {"outcome_id": OUTCOMES[outcome_key]})
     if resp.ok:
@@ -738,7 +865,9 @@ def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer=None):
     else:
         log(f"⚠️  Meeting Outcome write failed: {resp.status_code}: {resp.text[:200]}",
             indent=1)
-    return resp.ok
+        add_outcome_review(review_items, meeting, lead_id,
+                           "close_outcome_write_failed", outcome_label, close_m)
+    return resp.ok, "written" if resp.ok else "close_outcome_write_failed"
 
 
 # ===== Lead Qualified update (show-field write removed 2026-09-24) =====
@@ -937,7 +1066,8 @@ def custom_activity_already_exists(lead_id, type_id, avoma_meeting_uuid, call_id
 
 
 # ===== Enrichment =====
-def process_meeting(meeting, type_info, *, outcome_only=False):
+def process_meeting(meeting, type_info, *, outcome_only=False, review_items=None,
+                    matched_close_ids=None):
     uuid = meeting.get("uuid", "")
     title = meeting.get("subject", "")
 
@@ -969,6 +1099,8 @@ def process_meeting(meeting, type_info, *, outcome_only=False):
             match_method = f"title-name fallback ('{extracted}')"
     if not matched_lead:
         log(f"→ No Close lead found (email={prospect_email or 'none'}, title-extract failed), skip", indent=1)
+        add_outcome_review(review_items, meeting, None, "close_lead_match_missing",
+                           extract_outcome_label(meeting))
         return ("skipped", "no-match")
 
     lead_id = matched_lead["id"]
@@ -981,16 +1113,18 @@ def process_meeting(meeting, type_info, *, outcome_only=False):
     #    overwrites a terminal outcome, so re-running is free.
     outcome_label = extract_outcome_label(meeting)
     log(f"Outcome: {outcome_label!r}", indent=1)
-    outcome_synced = write_meeting_outcome(
+    outcome_synced, outcome_reason = write_meeting_outcome(
         lead_id,
         meeting,
         outcome_label,
-        required_offer=offer_family if offer_family != "vendingpreneurs" else None,
+        required_offer=offer_family,
+        review_items=review_items,
+        matched_close_ids=matched_close_ids,
     )
     if outcome_only:
-        return ("outcome-synced", "outcome-only") if outcome_synced else ("skipped", "outcome-not-synced")
+        return ("outcome-synced", "outcome-only") if outcome_synced else ("skipped", outcome_reason)
     if not is_first_sale_title(title):
-        return ("outcome-synced", "offer-outcome-only") if outcome_synced else ("skipped", "offer-outcome-not-synced")
+        return ("outcome-synced", "offer-outcome-only") if outcome_synced else ("skipped", outcome_reason)
     update_lead_qualified(lead_id, outcome_label)
 
     # 4. Require completed analysis for the Custom Activity portion
@@ -1115,10 +1249,16 @@ def main(*, outcome_only=False):
     section("Processing meetings")
     stats = {"enriched": 0, "outcome_synced": 0, "skipped": 0, "failed": 0}
     skip_reasons = {}
+    review_items = []
+    matched_close_ids = set()
 
     for meeting in meetings:
         try:
-            outcome, detail = process_meeting(meeting, type_info, outcome_only=outcome_only)
+            outcome, detail = process_meeting(
+                meeting, type_info, outcome_only=outcome_only,
+                review_items=review_items,
+                matched_close_ids=matched_close_ids,
+            )
             if outcome == "enriched":
                 stats["enriched"] += 1
             elif outcome == "outcome-synced":
@@ -1130,6 +1270,23 @@ def main(*, outcome_only=False):
             stats["failed"] += 1
             meeting_id = meeting.get("uuid", "?")
             log(f"❌ Error processing {meeting_id}: {e}", indent=1)
+            if outcome_only:
+                add_outcome_review(review_items, meeting, None,
+                                   "processing_exception", extract_outcome_label(meeting))
+
+    if outcome_only:
+        try:
+            close_candidates = fetch_close_blank_eligible_meetings(since_dt, until_dt)
+            stats["close_blank_eligible"] = len(close_candidates)
+            add_unmatched_close_reviews(review_items, close_candidates, matched_close_ids)
+            stats["close_missing_avoma_match"] = sum(
+                1 for item in review_items if item["reason"] == "no_unique_avoma_match"
+            )
+        except Exception as e:
+            stats["failed"] += 1
+            review_items.append({"reason": "close_meeting_census_failed",
+                                 "detail": str(e)[:500]})
+            log(f"Close meeting census failed: {e}", indent=1)
 
     section("Done")
     if outcome_only:
@@ -1139,6 +1296,21 @@ def main(*, outcome_only=False):
     for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
         log(f"  ({reason}: {count})", indent=1)
     log(f"Failed:   {stats['failed']}")
+    log(f"Needs review: {len(review_items)}")
+
+    if outcome_only:
+        with open("avoma_outcome_review.json", "w") as report_file:
+            json.dump({
+                "generated_at": until_dt.isoformat(),
+                "outcome_only": True,
+                "window_start": since_dt.isoformat(),
+                "window_end": until_dt.isoformat(),
+                "dry_run": DRY_RUN,
+                "stats": stats,
+                "review_count": len(review_items),
+                "review_items": review_items,
+            }, report_file, indent=2)
+        log("Review report: avoma_outcome_review.json")
 
     sys.exit(0 if stats["failed"] == 0 else 1)
 
