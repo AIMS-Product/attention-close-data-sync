@@ -15,6 +15,8 @@ COMPLETED_TAGS = {
     "not interested",
     "lost",
     "closed lost",
+    "decision made",
+    "follow up scheduled",
 }
 NO_SHOW_TAGS = {"no show", "no show up", "ghost", "ghosted"}
 RESCHEDULED_TAGS = {"reschedule", "rescheduled"}
@@ -56,6 +58,7 @@ def select_unique_close_meeting(
 ) -> tuple[dict | None, str]:
     """Match by lead, offer family, and time; never guess among candidates."""
     candidates = []
+    cancelled_candidates = []
     for meeting in meetings:
         if offer_family_from_title(meeting.get("title") or "") != required_offer:
             continue
@@ -70,7 +73,18 @@ def select_unique_close_meeting(
             close_start = close_start.replace(tzinfo=timezone.utc)
         gap = abs((close_start - avoma_start).total_seconds())
         if gap <= tolerance_hours * 3600:
-            candidates.append(meeting)
+            status = (meeting.get("status") or "").casefold()
+            title = (meeting.get("title") or "").strip().casefold()
+            if status in {"canceled", "cancelled"} or title.startswith(("canceled", "cancelled")):
+                cancelled_candidates.append(meeting)
+            else:
+                candidates.append(meeting)
+
+    # Prefer a live booking when an old canceled booking shares the same time
+    # window. If there is no live booking, retain the sole canceled activity so
+    # Avoma's cancellation tag can still map it to Cancelled/Rescheduled.
+    if not candidates:
+        candidates = cancelled_candidates
 
     if not candidates:
         return None, "close_match_missing"
