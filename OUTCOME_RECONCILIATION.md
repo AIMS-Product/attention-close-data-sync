@@ -30,3 +30,8 @@ outcome. Missing evidence does not imply Show/No Show or payout eligibility.
 Validation: `python -m unittest test_first_meeting_outcome_rules test_close_outcome_backlog test_native_outcome_backlog test_avoma_outcome test_qualified_routing`.
 Dispatch `avoma_outcome_reconcile.yml` with `dry_run=1` for read-only validation.
 Rollback: restore the previous source revision; keep recorded native outcomes.
+
+Historical confirmation cleanup is due November 11, 2026 at 9 AM Pacific;
+future appointments retain meeting-end-plus-48-hour deadlines. Original hosts
+own confirmations, with Anthony as the manager escalation owner. Uncertain
+outcomes stay pending until one confirms; no automatic Unknown outcome is used.

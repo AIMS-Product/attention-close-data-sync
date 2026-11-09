@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 import avoma_to_close_first_meeting_sync as sync
 from avoma_outcome_rules import select_unique_close_meeting
+from close_outcome_backlog import confirmation_due_at, MANAGER_REVIEW_OWNER_ID
 
 
 def external_emails(meeting):
@@ -108,9 +109,10 @@ def reconcile():
                 else:
                     reason = "avoma_match_missing" if not matches else "avoma_match_ambiguous"
             start = sync.avoma_meeting_start({"start_at": close_meeting.get("ends_at") or close_meeting.get("starts_at")})
-            due = start + timedelta(hours=48) if start else None
+            due = confirmation_due_at(start) if start else None
             report["review_items"].append({"close_activity_id": close_meeting["id"], "close_lead_id": lead_id,
                 "owner_id": close_meeting.get("user_id"), "reason": reason, **source_status,
+                "manager_review_owner_id": MANAGER_REVIEW_OWNER_ID, "requires_confirmation": True,
                 "review_due_at": due.isoformat() if due else None,
                 "overdue": due is None or now >= due})
         except Exception as error:

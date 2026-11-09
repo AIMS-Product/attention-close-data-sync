@@ -52,3 +52,13 @@ def read_outcome_backlog(search_page, get_seed_page, fields, now):
                 raise RuntimeError("Historical meeting seed filter was ignored")
             rows[row["id"]] = row
     return list(rows.values())
+
+
+REPAIR_STARTED = datetime(2026, 11, 9, 17, tzinfo=timezone.utc)
+HISTORICAL_CONFIRMATION_DUE = datetime(2026, 11, 11, 17, tzinfo=timezone.utc)
+MANAGER_REVIEW_OWNER_ID = "user_S7OGStPVefaxgTmDDxzGifAgBfgX12kjJ7O1XYfJkoq"
+
+
+def confirmation_due_at(meeting_end):
+    due = meeting_end + timedelta(hours=48)
+    return max(due, HISTORICAL_CONFIRMATION_DUE) if meeting_end < REPAIR_STARTED else due
