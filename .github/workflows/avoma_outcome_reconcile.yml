@@ -2,10 +2,14 @@ name: Avoma → Close Outcome Reconciliation
 
 on:
   schedule:
-    # Revisit every unresolved supported Close meeting; older meetings never age out.
+    # Recheck Avoma tags every six hours so late outcomes get another pass.
     - cron: '17 2,8,14,20 * * *'
   workflow_dispatch:
     inputs:
+      hours_back:
+        description: 'Avoma meeting history to reconcile, in hours'
+        required: false
+        default: '24'
       dry_run:
         description: 'Dry run (1 = no Close writes)'
         required: false
@@ -29,15 +33,16 @@ jobs:
 
       - run: pip install requests
 
-      - name: Test outcome reconciliation
-        run: python3 -m unittest test_first_meeting_outcome_rules test_close_outcome_backlog test_native_outcome_backlog
+      - name: Test attendance sync safeguards
+        run: python3 -m unittest test_first_meeting_outcome_rules test_avoma_identity_guards test_meeting_window
 
       - name: Reconcile Avoma outcomes
         env:
           CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
           AVOMA_API_KEY: ${{ secrets.AVOMA_API_KEY }}
+          HOURS_BACK: ${{ inputs.hours_back || '24' }}
           DRY_RUN: ${{ inputs.dry_run || '0' }}
-        run: python3 -u reconcile_close_outcome_backlog.py
+        run: python3 -u avoma_to_close_first_meeting_sync.py --outcome-only
 
       - name: Upload outcome review queue
         if: always()

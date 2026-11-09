@@ -88,7 +88,7 @@ import base64
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from close_outcome_backlog import read_outcome_backlog
+from close_meeting_window import read_meeting_window
 from avoma_outcome_rules import (
     cancellation_outcome,
     derive_meeting_outcome,
@@ -666,20 +666,15 @@ def fetch_close_meetings_for_lead(lead_id):
 
 
 def fetch_close_blank_eligible_meetings(since_dt, until_dt):
-    """The complete native backlog; meetings never expire because their start is old."""
+    """Enumerate blank/default supported meetings inside the configured lookback."""
     fields = "id,lead_id,user_id,title,starts_at,ends_at,date_created,status,outcome_id,calendar_event_uids,attendees"
-    def get_page(params):
-        response = close_get("/activity/meeting/", params=params)
-        if not response.ok:
-            raise RuntimeError(f"Close meeting census HTTP {response.status_code}")
-        return response.json()
     eligible = []
     def search_page(payload):
         response = close_post("/data/search/", payload)
         if not response.ok:
             raise RuntimeError(f"Close outcome search HTTP {response.status_code}")
         return response.json()
-    for meeting in read_outcome_backlog(search_page, get_page, fields, datetime.now(timezone.utc)):
+    for meeting in read_meeting_window(search_page, fields, since_dt, until_dt):
         if not is_supported_outcome_title(meeting.get("title") or ""):
             continue
         if meeting.get("outcome_id") and meeting["outcome_id"] != OUTCOMES["scheduled"]:
@@ -765,8 +760,7 @@ def find_close_meeting_activity(lead_id, avoma_start, required_offer, calendar_u
 
 
 def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer,
-                          review_items=None, matched_close_ids=None,
-                          matched_activity=None, known_lead_meetings=None):
+                          review_items=None, matched_close_ids=None):
     """
     Write Avoma's verdict onto the Close MEETING's native Outcome — the
     source of truth for show rates. Runs every pass (Avoma tags can land
@@ -785,13 +779,9 @@ def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer,
             f"(keys tried: {AVOMA_START_KEYS})", indent=1)
         add_outcome_review(review_items, meeting, lead_id, "avoma_start_unparseable", outcome_label)
         return False, "avoma_start_unparseable"
-    if matched_activity is not None:
-        close_m, match_reason = matched_activity, "matched"
-        lead_meetings = known_lead_meetings or []
-    else:
-        close_m, match_reason, lead_meetings = find_close_meeting_activity(
-            lead_id, avoma_start, required_offer, meeting.get("calendar_event_id")
-        )
+    close_m, match_reason, lead_meetings = find_close_meeting_activity(
+        lead_id, avoma_start, required_offer, meeting.get("calendar_event_id")
+    )
     if match_reason != "matched":
         log(f"⚠️  Close meeting match requires review: {match_reason}", indent=1)
         add_outcome_review(review_items, meeting, lead_id, match_reason, outcome_label)

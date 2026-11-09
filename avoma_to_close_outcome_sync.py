@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Reconcile native outcomes from Close's complete unresolved meeting backlog."""
-from reconcile_close_outcome_backlog import reconcile
+"""Run only the Avoma first-meeting outcome sync to Close."""
+
+from avoma_to_close_first_meeting_sync import main
+
 
 if __name__ == "__main__":
-    raise SystemExit(reconcile())
+    main(outcome_only=True)
