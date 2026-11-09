@@ -88,6 +88,7 @@ import base64
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from close_outcome_backlog import read_outcome_backlog
 from avoma_outcome_rules import (
     cancellation_outcome,
     derive_meeting_outcome,
@@ -238,7 +239,7 @@ def html_wrap(text):
 def close_get(path, params=None):
     url = path if path.startswith("http") else f"{CLOSE_API_BASE}{path}"
     for attempt in range(6):
-        resp = requests.get(url, headers=CLOSE_HEADERS, params=params)
+        resp = requests.get(url, headers=CLOSE_HEADERS, params=params, timeout=30)
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", "2"))
             log(f"[Close] 429 rate limited, waiting {wait}s...", indent=1)
@@ -253,7 +254,7 @@ def close_post(path, json_data):
     url = path if path.startswith("http") else f"{CLOSE_API_BASE}{path}"
     headers = {**CLOSE_HEADERS, "Content-Type": "application/json"}
     for attempt in range(6):
-        resp = requests.post(url, headers=headers, json=json_data)
+        resp = requests.post(url, headers=headers, json=json_data, timeout=30)
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", "2"))
             time.sleep(wait)
@@ -267,7 +268,7 @@ def close_put(path, json_data):
     url = path if path.startswith("http") else f"{CLOSE_API_BASE}{path}"
     headers = {**CLOSE_HEADERS, "Content-Type": "application/json"}
     for attempt in range(6):
-        resp = requests.put(url, headers=headers, json=json_data)
+        resp = requests.put(url, headers=headers, json=json_data, timeout=30)
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", "2"))
             time.sleep(wait)
@@ -650,7 +651,7 @@ def fetch_close_meetings_for_lead(lead_id):
             "lead_id": lead_id,
             "_skip": skip,
             "_limit": 100,
-            "_fields": "id,title,starts_at,status,outcome_id,user_id",
+            "_fields": "id,lead_id,title,starts_at,status,outcome_id,user_id,calendar_event_uids,attendees",
         })
         if not resp.ok:
             return None, "close_meeting_read_failed"
@@ -665,57 +666,30 @@ def fetch_close_meetings_for_lead(lead_id):
 
 
 def fetch_close_blank_eligible_meetings(since_dt, until_dt):
-    """Enumerate past blank/default Close meetings for the daily reconciliation."""
+    """The complete native backlog; meetings never expire because their start is old."""
+    fields = "id,lead_id,user_id,title,starts_at,ends_at,date_created,status,outcome_id,calendar_event_uids,attendees"
+    def get_page(params):
+        response = close_get("/activity/meeting/", params=params)
+        if not response.ok:
+            raise RuntimeError(f"Close meeting census HTTP {response.status_code}")
+        return response.json()
     eligible = []
-    skip = 0
-    fields = "id,lead_id,user_id,title,starts_at,date_created,status,outcome_id"
-    while True:
-        resp = close_get("/activity/meeting/", params={
-            "_skip": skip,
-            "_limit": 100,
-            "_fields": fields,
-        })
-        if not resp.ok:
-            raise RuntimeError("Close meeting census failed: "
-                               f"HTTP {resp.status_code}")
-        body = resp.json()
-        page = body.get("data", [])
-        page_all_old = True
-        for meeting in page:
-            title = meeting.get("title") or ""
-            current = meeting.get("outcome_id")
-            blank_or_default = not current or current == OUTCOMES["scheduled"]
-            raw_start = meeting.get("starts_at") or meeting.get("date_created")
-            if not raw_start:
-                page_all_old = False
-                if is_supported_outcome_title(title) and blank_or_default:
-                    eligible.append((meeting, "close_meeting_start_missing"))
-                continue
-            try:
-                start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=timezone.utc)
-            except (AttributeError, TypeError, ValueError):
-                page_all_old = False
-                if is_supported_outcome_title(title) and blank_or_default:
-                    eligible.append((meeting, "close_meeting_start_unparseable"))
-                continue
-            if start >= since_dt:
-                page_all_old = False
-            if start < since_dt or start > until_dt:
-                continue
-            if not is_supported_outcome_title(title):
-                continue
-            if not blank_or_default:
-                continue
-            missing_activity_start = not meeting.get("starts_at")
-            eligible.append((meeting,
-                             "close_meeting_start_missing" if missing_activity_start else None))
-        if page_all_old or not body.get("has_more"):
-            return eligible
-        if not page:
-            raise RuntimeError("Close meeting pagination stopped before the census completed")
-        skip += 100
+    def search_page(payload):
+        response = close_post("/data/search/", payload)
+        if not response.ok:
+            raise RuntimeError(f"Close outcome search HTTP {response.status_code}")
+        return response.json()
+    for meeting in read_outcome_backlog(search_page, get_page, fields, datetime.now(timezone.utc)):
+        if not is_supported_outcome_title(meeting.get("title") or ""):
+            continue
+        if meeting.get("outcome_id") and meeting["outcome_id"] != OUTCOMES["scheduled"]:
+            continue
+        start = avoma_meeting_start({"start_at": meeting.get("starts_at")})
+        if start is None:
+            eligible.append((meeting, "close_meeting_start_missing_or_unparseable"))
+        elif since_dt <= start <= until_dt:
+            eligible.append((meeting, None))
+    return eligible
 
 
 def review_due_at(now=None):
@@ -778,20 +752,21 @@ def add_outcome_review(review_items, avoma_meeting, lead_id, reason, label="",
     })
 
 
-def find_close_meeting_activity(lead_id, avoma_start, required_offer):
+def find_close_meeting_activity(lead_id, avoma_start, required_offer, calendar_uid=None):
     """Return a unique same-offer, time-near Close meeting or an explicit review reason."""
     meetings, error = fetch_close_meetings_for_lead(lead_id)
     if error:
         return None, error, []
     match, reason = select_unique_close_meeting(
         meetings, avoma_start, required_offer,
-        offer_family_from_title, MEETING_MATCH_HOURS,
+        offer_family_from_title, MEETING_MATCH_HOURS, calendar_uid=calendar_uid,
     )
     return match, reason, meetings
 
 
 def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer,
-                          review_items=None, matched_close_ids=None):
+                          review_items=None, matched_close_ids=None,
+                          matched_activity=None, known_lead_meetings=None):
     """
     Write Avoma's verdict onto the Close MEETING's native Outcome — the
     source of truth for show rates. Runs every pass (Avoma tags can land
@@ -810,9 +785,13 @@ def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer,
             f"(keys tried: {AVOMA_START_KEYS})", indent=1)
         add_outcome_review(review_items, meeting, lead_id, "avoma_start_unparseable", outcome_label)
         return False, "avoma_start_unparseable"
-    close_m, match_reason, lead_meetings = find_close_meeting_activity(
-        lead_id, avoma_start, required_offer
-    )
+    if matched_activity is not None:
+        close_m, match_reason = matched_activity, "matched"
+        lead_meetings = known_lead_meetings or []
+    else:
+        close_m, match_reason, lead_meetings = find_close_meeting_activity(
+            lead_id, avoma_start, required_offer, meeting.get("calendar_event_id")
+        )
     if match_reason != "matched":
         log(f"⚠️  Close meeting match requires review: {match_reason}", indent=1)
         add_outcome_review(review_items, meeting, lead_id, match_reason, outcome_label)
@@ -847,7 +826,13 @@ def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer,
         add_outcome_review(review_items, meeting, lead_id,
                            "close_outcome_reread_failed", outcome_label, close_m)
         return False, "close_outcome_reread_failed"
-    fresh_current = fresh_resp.json().get("outcome_id")
+    fresh = fresh_resp.json()
+    if any(fresh.get(key) != close_m.get(key)
+           for key in ("id", "lead_id", "user_id", "starts_at", "title", "status")):
+        add_outcome_review(review_items, meeting, lead_id,
+                           "close_meeting_identity_changed", outcome_label, close_m)
+        return False, "close_meeting_identity_changed"
+    fresh_current = fresh.get("outcome_id")
     fresh_action = terminal_outcome_action(
         fresh_current, OUTCOMES["scheduled"], OUTCOMES[outcome_key]
     )
@@ -860,6 +845,11 @@ def write_meeting_outcome(lead_id, meeting, outcome_label, required_offer,
     resp = close_put(f"/activity/meeting/{close_m['id']}/",
                      {"outcome_id": OUTCOMES[outcome_key]})
     if resp.ok:
+        verified = close_get(f"/activity/meeting/{close_m['id']}/")
+        if not verified.ok or verified.json().get("outcome_id") != OUTCOMES[outcome_key]:
+            add_outcome_review(review_items, meeting, lead_id,
+                               "close_outcome_readback_failed", outcome_label, close_m)
+            return False, "close_outcome_readback_failed"
         log(f"✅ Meeting Outcome set to '{outcome_key}' on {close_m['id']} "
             f"(from Avoma tag '{outcome_label}')", indent=1)
     else:
@@ -1039,16 +1029,13 @@ def find_close_lead_by_title(title):
     )
     if not resp.ok:
         return None
-    leads = resp.json().get("data", [])
-    if not leads:
+    body = resp.json()
+    if body.get("has_more"):
         return None
-    name_lower = name.lower()
-    for lead in leads:
-        if name_lower in (lead.get("display_name") or "").lower():
-            return lead
-    if len(leads) == 1:
-        return leads[0]
-    return None
+    normalized = lambda value: " ".join(re.findall(r"\w+", value.casefold()))
+    matches = [lead for lead in body.get("data", [])
+               if normalized(name) == normalized(lead.get("display_name") or "")]
+    return matches[0] if len(matches) == 1 else None
 
 
 # ===== Idempotency =====
@@ -1088,7 +1075,7 @@ def process_meeting(meeting, type_info, *, outcome_only=False, review_items=None
     match_method = None
     if prospect_email:
         matched_lead = find_close_lead_by_email(
-            prospect_email, require_unique=offer_family == "acquisition_ace"
+            prospect_email, require_unique=True
         )
         if matched_lead:
             match_method = f"email ({prospect_email})"

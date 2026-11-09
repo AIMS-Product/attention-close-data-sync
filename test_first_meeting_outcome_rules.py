@@ -117,8 +117,9 @@ class AttendanceRules(unittest.TestCase):
         with patch.object(sync, "find_close_meeting_activity",
                           return_value=(self.close_meeting, "matched", [self.close_meeting])), \
                 patch.object(sync, "DRY_RUN", False), \
-                patch.object(sync, "close_get", return_value=SimpleNamespace(
-                    ok=True, json=lambda: {"outcome_id": None})), \
+                patch.object(sync, "close_get", side_effect=[
+                    SimpleNamespace(ok=True, json=lambda: self.close_meeting),
+                    SimpleNamespace(ok=True, json=lambda: {**self.close_meeting, "outcome_id": sync.OUTCOMES["completed"]})]), \
                 patch.object(sync, "close_put", return_value=SimpleNamespace(ok=True)) as put:
             self.assertEqual(sync.write_meeting_outcome(
                 "lead", self.meeting, "Follow-up Scheduled", "acquisition_ace"

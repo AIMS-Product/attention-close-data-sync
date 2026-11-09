@@ -55,10 +55,15 @@ def select_unique_close_meeting(
     required_offer: str,
     offer_family_from_title,
     tolerance_hours: int,
+    calendar_uid: str | None = None,
 ) -> tuple[dict | None, str]:
     """Match by lead, offer family, and time; never guess among candidates."""
     candidates = []
     cancelled_candidates = []
+    if calendar_uid:
+        identity_matches = [m for m in meetings if calendar_uid in (m.get("calendar_event_uids") or [])]
+        if identity_matches:
+            meetings = identity_matches
     for meeting in meetings:
         if offer_family_from_title(meeting.get("title") or "") != required_offer:
             continue
