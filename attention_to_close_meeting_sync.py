@@ -105,6 +105,8 @@ Optional env vars:
                                 exists once real analysis lands and skips.
 """
 
+from qualification_provenance import qualification_payload
+
 import os
 import sys
 import re
@@ -742,7 +744,7 @@ def get_lead_qualified_override(lead_id):
     fields = f"id,custom.{QUALIFIED_OVERRIDE_FIELD},custom.{QUALIFIED_FIELD}"
     resp = close_get(f"/lead/{lead_id}/", params={"_fields": fields})
     if not resp.ok:
-        return {"qualified_override": None, "qualified_current": None}
+        raise RuntimeError("Cannot verify qualification override and current value")
     data = resp.json()
     return {
         "qualified_override": data.get(f"custom.{QUALIFIED_OVERRIDE_FIELD}"),
@@ -750,7 +752,7 @@ def get_lead_qualified_override(lead_id):
     }
 
 
-def update_lead_qualified(lead_id, outcome_label):
+def update_lead_qualified(lead_id, outcome_label, source_call_id=None):
     """
     ADDED 2026-09-16 — extends Qualified-writing beyond the first call.
     Real-world evidence: a genuine "Qualified" Outcome was tagged on a
@@ -778,7 +780,11 @@ def update_lead_qualified(lead_id, outcome_label):
         )
         return {}
 
-    payload = {f"custom.{QUALIFIED_FIELD}": qualified_value}
+    try:
+        payload = qualification_payload(qualified_value, outcome_label, source_call_id, provider="avoma")
+    except ValueError as error:
+        log(f"Qualification skipped: {error}", indent=1)
+        return {}
 
     if DRY_RUN:
         log(f"DRY_RUN — would PUT lead {lead_id} with: {payload}", indent=1)
@@ -1151,7 +1157,7 @@ def process_meeting(meeting, type_info):
         # Qualified-writing (ADDED 2026-09-16) is unconditional on
         # meeting_type — reuses the override-respecting update function,
         # which itself honors DRY_RUN for the actual PUT.
-        update_lead_qualified(lead_id, outcome_label)
+        update_lead_qualified(lead_id, outcome_label, uuid)
         return ("skipped", "dry-run")
 
     resp = close_post("/activity/custom/", payload)
@@ -1180,7 +1186,7 @@ def process_meeting(meeting, type_info):
     # since Qualified/Disqualified can be tagged on Discovery, Setter,
     # Next Steps, or Other calls too, not just Follow-up. Does NOT touch
     # First Call Show Up (exclusive to avoma_to_close_first_meeting_sync.py).
-    qualified_result = update_lead_qualified(lead_id, outcome_label)
+    qualified_result = update_lead_qualified(lead_id, outcome_label, uuid)
     if qualified_result:
         log(f"Updated lead fields: {qualified_result}", indent=1)
 

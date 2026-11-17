@@ -108,6 +108,8 @@ Optional env vars:
                                 it re-runs on every pass regardless.)
 """
 
+from qualification_provenance import qualification_payload
+
 import os
 import sys
 import re
@@ -758,7 +760,7 @@ def get_lead_overrides(lead_id):
     )
     resp = close_get(f"/lead/{lead_id}/", params={"_fields": fields})
     if not resp.ok:
-        return {"qualified_override": None, "qualified_current": None}
+        raise RuntimeError("Cannot verify qualification override and current value")
     data = resp.json()
     return {
         "qualified_override": data.get(f"custom.{QUALIFIED_OVERRIDE_FIELD}"),
@@ -766,7 +768,7 @@ def get_lead_overrides(lead_id):
     }
 
 
-def update_lead_qualified(lead_id, outcome_label):
+def update_lead_qualified(lead_id, outcome_label, source_call_id=None):
     qualified_value = derive_qualified_value(outcome_label)
     if qualified_value is None:
         return {}
@@ -782,7 +784,11 @@ def update_lead_qualified(lead_id, outcome_label):
         )
         return {}
 
-    payload = {f"custom.{QUALIFIED_FIELD}": qualified_value}
+    try:
+        payload = qualification_payload(qualified_value, outcome_label, source_call_id, provider='avoma')
+    except ValueError as error:
+        log(f"Qualification skipped: {error}", indent=1)
+        return {}
     if DRY_RUN:
         log(f"DRY_RUN — would PUT lead {lead_id} with: {payload}", indent=1)
         return payload
@@ -997,7 +1003,7 @@ def process_meeting(meeting, type_info):
         # Activity + Qualified enrichment is first-sale-only.
         log("→ Outcome synced; not a first sales call, skip CA/Qualified", indent=1)
         return ("skipped", "outcome-only")
-    update_lead_qualified(lead_id, outcome_label)
+    update_lead_qualified(lead_id, outcome_label, uuid)
 
     # 4. Require completed analysis for the Custom Activity portion
     evaluations = avoma_get_scorecard_evaluations(uuid)

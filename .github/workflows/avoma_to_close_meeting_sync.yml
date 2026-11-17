@@ -49,6 +49,9 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
+      - name: Verify qualification provenance rules
+        run: python3 -m unittest test_qualification_provenance test_qualified_routing -v
+
       - name: Run meeting analysis sync
         env:
           CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
