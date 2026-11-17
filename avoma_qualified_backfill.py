@@ -46,6 +46,8 @@ Optional env vars:
   BACKFILL_UNTIL       ISO8601 UTC, default: now
 """
 
+from qualification_provenance import qualification_payload
+
 import os
 import sys
 import csv
@@ -472,8 +474,8 @@ def get_lead_qualified_state(lead_id):
     }
 
 
-def write_lead_qualified(lead_id, value):
-    payload = {f"custom.{QUALIFIED_FIELD}": value}
+def write_lead_qualified(lead_id, value, reason, source_call_id):
+    payload = qualification_payload(value, reason, source_call_id, provider="avoma")
     if DRY_RUN:
         log(f"DRY_RUN — would PUT lead {lead_id} with: {payload}", indent=1)
         return True
@@ -598,7 +600,8 @@ def process_meeting(meeting):
     row["derived_value"] = derived_value
 
     # 4. Write
-    ok = write_lead_qualified(lead_id, derived_value)
+    reason = outcome_label if outcome_label else "AI-inferred " + row["ai_verdict"] + " (Avoma notes)"
+    ok = write_lead_qualified(lead_id, derived_value, reason, uuid)
     if ok:
         log(f"{'DRY_RUN — would set' if DRY_RUN else '✅ Set'} Qualified = {derived_value!r} on lead {lead_name}", indent=1)
         row["action"] = "dry-run-would-write" if DRY_RUN else "written"

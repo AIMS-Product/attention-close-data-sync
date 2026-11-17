@@ -123,6 +123,8 @@ Optional env vars:
                                 exists once real analysis lands and skips.
 """
 
+from qualification_provenance import qualification_payload
+
 import os
 import sys
 import re
@@ -762,7 +764,7 @@ def get_lead_qualified_override(lead_id):
     fields = f"id,custom.{QUALIFIED_OVERRIDE_FIELD},custom.{QUALIFIED_FIELD}"
     resp = close_get(f"/lead/{lead_id}/", params={"_fields": fields})
     if not resp.ok:
-        return {"qualified_override": None, "qualified_current": None}
+        raise RuntimeError("Cannot verify qualification override and current value")
     data = resp.json()
     return {
         "qualified_override": data.get(f"custom.{QUALIFIED_OVERRIDE_FIELD}"),
@@ -770,7 +772,7 @@ def get_lead_qualified_override(lead_id):
     }
 
 
-def update_lead_qualified(lead_id, outcome_label, meeting_type="Other"):
+def update_lead_qualified(lead_id, outcome_label, meeting_type="Other", source_call_id=None):
     """
     ADDED 2026-09-16 — extends Qualified-writing beyond the first call.
     Real-world evidence: a genuine "Qualified" Outcome was tagged on a
@@ -814,7 +816,11 @@ def update_lead_qualified(lead_id, outcome_label, meeting_type="Other"):
         log(f"Qualified already set to {qualified_value!r}; no change needed", indent=1)
         return {}
 
-    payload = {f"custom.{QUALIFIED_FIELD}": qualified_value}
+    try:
+        payload = qualification_payload(qualified_value, outcome_label, source_call_id, provider="avoma")
+    except ValueError as error:
+        log(f"Qualification skipped: {error}", indent=1)
+        return {}
 
     if DRY_RUN:
         log(f"DRY_RUN — would PUT lead {lead_id} with: {payload} (previous value: {previous!r})", indent=1)
@@ -1186,7 +1192,7 @@ def process_meeting(meeting, type_info):
         else:
             log(f"Meeting Type is {meeting_type!r}; no follow-up slot update applies", indent=1)
         # Qualified-writing skips setter/discovery calls and honors DRY_RUN.
-        update_lead_qualified(lead_id, outcome_label, meeting_type)
+        update_lead_qualified(lead_id, outcome_label, meeting_type, uuid)
         return ("skipped", "dry-run")
 
     resp = close_post("/activity/custom/", payload)
@@ -1213,7 +1219,7 @@ def process_meeting(meeting, type_info):
 
     # Qualified-writing skips setter/discovery calls. Does NOT touch First
     # Call Show Up (exclusive to avoma_to_close_first_meeting_sync.py).
-    qualified_result = update_lead_qualified(lead_id, outcome_label, meeting_type)
+    qualified_result = update_lead_qualified(lead_id, outcome_label, meeting_type, uuid)
     if qualified_result:
         log(f"Updated lead fields: {qualified_result}", indent=1)
 
